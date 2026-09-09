@@ -47,6 +47,26 @@ SYSTEM_PROMPT = (
     "guessing. Chain multiple tool calls when a task "
     "needs more than one step. When you have enough information to fully "
     "answer, respond with plain text and no further tool calls.\n\n"
+    "Your own files are fair game for those same tools - agent.py, "
+    "tools.py, and vault/INDEX.md, including your own startup behavior. "
+    "You are not a general-purpose chatbot with no access to itself: you "
+    "genuinely can read and edit your own code and configuration, right "
+    "now, with write_file/edit_file. If Mark asks you to change how you "
+    "start up, what you say, or how you behave, actually make the edit "
+    "instead of reflexively saying you can't modify yourself - that "
+    "reflex is wrong here and has caused a real false refusal before.\n\n"
+    "You also have real persistent memory across separate conversations "
+    "- this is not a stateless chatbot. TASKS.md tracks open and "
+    "completed work, LESSONS.md tracks what you've learned, and the "
+    "daily notes track what happened each day - all of it survives "
+    "between runs and a relevant tail is auto-loaded into every new "
+    "conversation's system prompt below. If asked what's on your "
+    "to-do list, what's still open, or what you remember from before, "
+    "check the Open Tasks section below or call list_open_tasks / "
+    "search_vault - never say you don't track tasks or don't remember "
+    "past interactions, that's false and has been said before by "
+    "mistake. Log a new task with add_task when something's left open; "
+    "close it with complete_task once it's actually done.\n\n"
     "Whenever you find a real fix, a working method, or a dead end worth "
     "ruling out for next time, call append_lesson to record it - not "
     "every little thing, just what would actually save time if you (or a "
@@ -69,10 +89,17 @@ def _build_system_prompt() -> str:
     index = tools.read_index()
     recent = tools.recent_daily_notes()
     lessons = tools.recent_lessons()
+    open_tasks = tools.open_tasks_section()
 
     parts = [SYSTEM_PROMPT]
     if index:
         parts.append("Vault index (identity and map):\n\n" + index)
+    if open_tasks:
+        parts.append(
+            "Open tasks tracked across sessions - this is your real "
+            "memory of what's outstanding, not something to claim you "
+            "don't have:\n\n" + open_tasks
+        )
     if recent:
         parts.append(
             "Today's daily note so far. If it already answers the "
@@ -283,7 +310,7 @@ def run_voice_loop() -> None:
 # rule, just a tighter leash, since this runs on a weaker local model.
 RELAY_SAFE_TOOLS = {
     "read_file", "glob_files", "search_files", "search_vault",
-    "web_fetch", "append_lesson", "append_daily_note",
+    "web_fetch", "append_lesson", "append_daily_note", "list_open_tasks",
 }
 
 RELAY_CONFIG_PATH = pathlib.Path(__file__).parent / "relay_config.json"

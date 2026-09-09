@@ -31,6 +31,7 @@ VAULT_DIR = WORKSPACE / "vault"
 INDEX_FILE = VAULT_DIR / "INDEX.md"
 DAILY_DIR = VAULT_DIR / "daily"
 LESSONS_FILE = VAULT_DIR / "LESSONS.md"
+TASKS_FILE = VAULT_DIR / "TASKS.md"
 
 DAILY_TEMPLATE = "# {date}\n\n"
 LESSONS_TEMPLATE = (
@@ -40,6 +41,18 @@ LESSONS_TEMPLATE = (
     "file logs what was learned, so a later run doesn't pay the discovery\n"
     "tax twice. Append with `append_lesson`; a tail of this file is "
     "auto-loaded into every run, same as INDEX.md.\n"
+)
+TASKS_TEMPLATE = (
+    "# Tasks\n\n"
+    "Real persistent tracking of open and completed work across "
+    "sessions - not something to ever claim you don't have. The Open "
+    "section auto-loads into every run's system prompt, same as "
+    "INDEX.md and LESSONS.md's tail. Add an item with `add_task` when "
+    "something's left open or worth tracking; close it with "
+    "`complete_task` when it's actually done, don't leave it stale. "
+    "Check `list_open_tasks` if asked what's outstanding.\n\n"
+    "## Open\n\n"
+    "## Completed\n"
 )
 
 
@@ -164,6 +177,116 @@ def recent_lessons(max_chars: int = 2000) -> str:
     if not text:
         return ""
     return text[-max_chars:] if len(text) > max_chars else text
+
+
+def _ensure_tasks_file() -> pathlib.Path:
+    """Auto-create TASKS.md from a minimal template if it doesn't exist
+    yet - mirrors the daily note's and LESSONS.md's own 'create from
+    template if missing' habit."""
+    if not TASKS_FILE.exists():
+        VAULT_DIR.mkdir(parents=True, exist_ok=True)
+        TASKS_FILE.write_text(TASKS_TEMPLATE, encoding="utf-8")
+    return TASKS_FILE
+
+
+def _split_tasks(text: str) -> tuple[str, str, str]:
+    """Split TASKS.md's raw text into (before_open, open_body,
+    rest_from_completed_on). `open_body` is everything between the
+    '## Open' and '## Completed' headers - the actual list of open
+    items, with its surrounding blank lines intact so re-joining is
+    lossless."""
+    open_marker = "## Open"
+    done_marker = "## Completed"
+    open_idx = text.index(open_marker) + len(open_marker)
+    done_idx = text.index(done_marker)
+    return text[:open_idx], text[open_idx:done_idx], text[done_idx:]
+
+
+def add_task(args: dict) -> str:
+    """Log a new open task - real cross-session tracking, not a daily
+    journal entry. Appends a checkbox line under TASKS.md's Open
+    section, dated today."""
+    text = args["text"].strip()
+    today = datetime.date.today().isoformat()
+    path = _ensure_tasks_file()
+    try:
+        content = path.read_text(encoding="utf-8")
+        before, open_body, rest = _split_tasks(content)
+        new_line = f"- [ ] {text} (opened {today})\n"
+        open_body = open_body.rstrip("\n") + "\n" + new_line + "\n"
+        path.write_text(before + open_body + rest, encoding="utf-8")
+        return f"OK: added open task to {path.relative_to(WORKSPACE)}"
+    except ValueError:
+        return "ERROR: TASKS.md is missing its ## Open/## Completed headers - don't guess, ask Mark before hand-editing the structure."
+    except Exception as e:
+        return f"ERROR adding task: {e}"
+
+
+def complete_task(args: dict) -> str:
+    """Mark an open task done - moves its line from the Open section to
+    Completed, dated today, with an outcome. Refuses to guess when the
+    match isn't unique, same safety property as edit_file."""
+    match = args["match"].strip().lower()
+    outcome = args.get("outcome", "").strip()
+    path = _ensure_tasks_file()
+    try:
+        content = path.read_text(encoding="utf-8")
+        before, open_body, rest = _split_tasks(content)
+    except ValueError:
+        return "ERROR: TASKS.md is missing its ## Open/## Completed headers - don't guess, ask Mark before hand-editing the structure."
+    except Exception as e:
+        return f"ERROR reading tasks: {e}"
+
+    lines = open_body.splitlines()
+    hits = [i for i, line in enumerate(lines) if line.strip().startswith("- [ ]") and match in line.lower()]
+    if not hits:
+        return f"ERROR: no open task matching {args['match']!r}."
+    if len(hits) > 1:
+        return f"ERROR: {len(hits)} open tasks match {args['match']!r} - not unique, give more specific text."
+
+    i = hits[0]
+    task_line = lines[i].strip()[len("- [ ]"):].strip()
+    task_line = re.sub(r"\s*\(opened \d{4}-\d{2}-\d{2}\)\s*$", "", task_line)
+    today = datetime.date.today().isoformat()
+    del lines[i]
+    open_body = ("\n".join(lines).rstrip("\n") + "\n\n") if any(l.strip() for l in lines) else "\n\n"
+
+    done_line = f"- [x] {task_line} (closed {today})"
+    if outcome:
+        done_line += f" — {outcome}"
+    rest = rest.rstrip("\n") + "\n" + done_line + "\n"
+
+    try:
+        path.write_text(before + open_body + rest, encoding="utf-8")
+    except Exception as e:
+        return f"ERROR writing tasks: {e}"
+    return f"OK: closed task in {path.relative_to(WORKSPACE)}: {task_line}"
+
+
+def open_tasks_section(max_chars: int = 2000) -> str:
+    """Return TASKS.md's Open section (header included), or '' if empty
+    or the file doesn't exist yet. Not a model-callable tool - used by
+    the agent loop to auto-load open tasks at the start of every run,
+    same principle as recent_daily_notes/recent_lessons: don't rely on
+    the model remembering to go look."""
+    if not TASKS_FILE.exists():
+        return ""
+    try:
+        _, open_body, _ = _split_tasks(TASKS_FILE.read_text(encoding="utf-8"))
+    except ValueError:
+        return ""
+    text = ("## Open" + open_body).strip()
+    if text == "## Open":
+        return ""
+    return text[-max_chars:] if len(text) > max_chars else text
+
+
+def list_open_tasks(args: dict) -> str:
+    """Model-callable version of open_tasks_section - lets the model
+    check on demand (e.g. if asked what's outstanding mid-conversation)
+    instead of only relying on what auto-loaded at session start."""
+    section = open_tasks_section(max_chars=6000)
+    return section if section else "No open tasks tracked right now."
 
 
 def search_vault(args: dict) -> str:
@@ -451,6 +574,9 @@ REGISTRY = {
     "run_shell": run_shell,
     "append_daily_note": append_daily_note,
     "append_lesson": append_lesson,
+    "add_task": add_task,
+    "complete_task": complete_task,
+    "list_open_tasks": list_open_tasks,
     "search_vault": search_vault,
     "glob_files": glob_files,
     "search_files": search_files,
@@ -534,6 +660,43 @@ SCHEMAS = [
                 },
                 "required": ["lesson"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_task",
+            "description": "Log a new open task in TASKS.md - real persistent tracking across sessions, not a daily journal entry. Use this whenever something is left open, blocked, or worth following up on later.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "The task itself, plain description."},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "complete_task",
+            "description": "Mark an open task done - moves it from TASKS.md's Open section to Completed, dated today. Fails if the match isn't unique among open tasks (give more specific text).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "match": {"type": "string", "description": "Substring that uniquely identifies the open task to close."},
+                    "outcome": {"type": "string", "description": "Optional short note on how it was resolved."},
+                },
+                "required": ["match"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_open_tasks",
+            "description": "Return the current list of open tasks from TASKS.md. Use this if asked what's outstanding, on your to-do list, or still in progress - don't claim you have no memory of past or current tasks.",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {
