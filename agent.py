@@ -32,13 +32,16 @@ MAX_STEPS = 10
 _FAKE_TOOL_CALL_RE = re.compile(r"<function[=\s]", re.IGNORECASE)
 
 SYSTEM_PROMPT = (
-    "You are a local agent running entirely offline. You have tools to "
-    "read and write files, run shell commands, and append to or search a "
-    "persistent vault (your identity and daily notes). Use tools "
-    "whenever a task needs real information or a real action instead of "
-    "guessing. Chain multiple tool calls when a task needs more than one "
-    "step. When you have enough information to fully answer, respond "
-    "with plain text and no further tool calls."
+    "You are a local agent running mostly offline. You have tools to read, "
+    "write, and edit files, search files by name or content, run shell "
+    "commands, fetch a URL you already have (no web search - you cannot "
+    "look things up on your own), append to or search a persistent vault "
+    "(your identity and daily notes), spin off a subagent for a "
+    "self-contained side task, and schedule a future one-time run of "
+    "yourself. Use tools whenever a task needs real information or a real "
+    "action instead of guessing. Chain multiple tool calls when a task "
+    "needs more than one step. When you have enough information to fully "
+    "answer, respond with plain text and no further tool calls."
 )
 
 
@@ -209,10 +212,15 @@ if __name__ == "__main__":
         run_voice_loop()
     elif len(sys.argv) >= 2 and sys.argv[1] == "--chat":
         run_chat()
+    elif len(sys.argv) >= 3 and sys.argv[1] == "--speak":
+        # Used by schedule_task's generated .bat wrapper so a scheduled
+        # one-shot run speaks its answer instead of just printing it.
+        run_task(" ".join(sys.argv[2:]), speak_answer=True)
     elif len(sys.argv) < 2:
         print('Usage: python agent.py "your task here"')
         print('       python agent.py --chat')
         print('       python agent.py --voice')
+        print('       python agent.py --speak "your task here"')
         sys.exit(1)
     else:
         run_task(" ".join(sys.argv[1:]))
