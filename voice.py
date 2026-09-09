@@ -10,6 +10,7 @@ speak(text) -> synthesizes text with Piper and plays it back.
 
 import os
 import queue
+import re
 import threading
 import time
 from pathlib import Path
@@ -178,8 +179,51 @@ def _transcribe(audio: np.ndarray) -> str:
     return " ".join(seg.text.strip() for seg in segments).strip()
 
 
+# Markdown syntax the model sometimes writes even when the answer is
+# headed straight to Piper - none of it means anything spoken aloud, and
+# left in, Piper reads the literal symbols (asterisks, pipes, backticks)
+# as if they were words. Stripped here, once, so every call site that
+# speaks gets clean text without having to remember to clean it itself.
+_MD_CODE_FENCE_RE = re.compile(r"```.*?```", re.S)
+_MD_INLINE_CODE_RE = re.compile(r"`([^`]*)`")
+_MD_BOLD_ITALIC_RE = re.compile(r"(\*\*\*|\*\*|\*|__)(.*?)\1")
+_MD_HEADER_RE = re.compile(r"^\s{0,3}#{1,6}\s*", re.M)
+_MD_BULLET_RE = re.compile(r"^\s*[-*+]\s+", re.M)
+_MD_NUMBERED_RE = re.compile(r"^\s*\d+\.\s+", re.M)
+_MD_TABLE_SEP_RE = re.compile(r"^[\s|:-]+$", re.M)
+_MD_TABLE_ROW_RE = re.compile(r"^\|(.*)\|\s*$", re.M)
+
+
+def strip_for_speech(text: str) -> str:
+    """Clean model output down to plain conversational text before it
+    reaches Piper - strip markdown that would otherwise get read aloud
+    as literal symbols, and collapse whitespace into natural sentence
+    spacing instead of a run-on."""
+    text = _MD_CODE_FENCE_RE.sub(" (code omitted) ", text)
+    text = _MD_TABLE_SEP_RE.sub("", text)
+    text = _MD_TABLE_ROW_RE.sub(lambda m: m.group(1).replace("|", ", "), text)
+    text = _MD_INLINE_CODE_RE.sub(r"\1", text)
+    text = _MD_BOLD_ITALIC_RE.sub(r"\2", text)
+    text = _MD_HEADER_RE.sub("", text)
+    text = _MD_BULLET_RE.sub("", text)
+    text = _MD_NUMBERED_RE.sub("", text)
+    text = re.sub(r"\n{2,}", ". ", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n", ". ", text)
+    # Stripping symbols above tends to leave doubled/dangling punctuation
+    # (empty table cells, a header's trailing colon meeting a sentence's
+    # period) - clean that up so pauses land where a sentence actually
+    # ends, not after every stray leftover mark.
+    text = re.sub(r"\s+([,.])", r"\1", text)
+    text = re.sub(r"([,.])\1+", r"\1", text)
+    text = re.sub(r",\s*\.", ".", text)
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip()
+
+
 def speak(text: str) -> None:
-    """Synthesize text with Piper and play it back."""
+    """Clean and synthesize text with Piper, then play it back."""
+    text = strip_for_speech(text)
     if not text.strip():
         return
 
