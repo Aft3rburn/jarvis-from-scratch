@@ -8,6 +8,7 @@ raw repr.
 """
 
 import datetime
+import difflib
 import json
 import pathlib
 import re
@@ -54,6 +55,99 @@ TASKS_TEMPLATE = (
     "## Open\n\n"
     "## Completed\n"
 )
+
+
+# --- Write-time spam/duplicate guard for append_daily_note and
+# append_lesson ---
+#
+# Root cause this exists for (2026-09-09): the model, stuck making no
+# real progress, repeatedly logged near-identical "still blocked"
+# status entries to LESSONS.md and the daily note instead of trying
+# something different - 20+ entries in one case, 6 in 3 minutes in the
+# other. Since a tail of both files auto-loads into every run's system
+# prompt, that noise crowded out the real answer and got parroted back
+# as fact. This guard stops the write itself instead of relying on a
+# human to notice and clean it up after the fact.
+
+_NEAR_DUP_THRESHOLD = 0.6  # SequenceMatcher ratio on normalized text
+_SPAM_WINDOW_MINUTES = 5
+_SPAM_MAX_IN_WINDOW = 3
+
+
+def _normalize_for_compare(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def _split_entry_bodies(text: str) -> list:
+    """Split a LESSONS.md/daily-note body into a list of entry bodies, one
+    per '## ' header block, in file order. Content before the first
+    header (title/intro) is dropped."""
+    parts = re.split(r"(?m)^## .*$", text)
+    return [p.strip() for p in parts[1:] if p.strip()]
+
+
+def _extract_headers(text: str) -> list:
+    return re.findall(r"(?m)^## (.*)$", text)
+
+
+def _write_guard(existing_text: str, new_text: str, parse_ts) -> str:
+    """Returns a BLOCKED message string if the write should be refused, or
+    '' if it's fine to proceed. parse_ts(header_str) -> datetime|None is
+    file-format-specific (daily note headers are bare 'HH:MM', LESSONS.md
+    headers are 'YYYY-MM-DD HH:MM — topic')."""
+    bodies = _split_entry_bodies(existing_text)
+    if not bodies:
+        return ""
+
+    new_norm = _normalize_for_compare(new_text)
+    for body in bodies[-_SPAM_MAX_IN_WINDOW:]:
+        ratio = difflib.SequenceMatcher(None, new_norm, _normalize_for_compare(body)).ratio()
+        if ratio >= _NEAR_DUP_THRESHOLD:
+            return (
+                f"BLOCKED: this is a near-duplicate ({ratio:.0%} similar) of "
+                "an entry you already logged. Don't log the same status "
+                "again - either try a genuinely different approach, check "
+                "if the answer's already recorded (search_vault / "
+                "read_file), or just answer directly instead of logging "
+                "another status update."
+            )
+
+    headers = _extract_headers(existing_text)
+    now = datetime.datetime.now()
+    recent_count = 0
+    for h in headers[-_SPAM_MAX_IN_WINDOW:]:
+        ts = parse_ts(h)
+        if ts and (now - ts) <= datetime.timedelta(minutes=_SPAM_WINDOW_MINUTES):
+            recent_count += 1
+    if recent_count >= _SPAM_MAX_IN_WINDOW:
+        return (
+            f"BLOCKED: {recent_count} entries already logged to this file "
+            f"in the last {_SPAM_WINDOW_MINUTES} minutes - that's spinning, "
+            "not progress. Stop logging status updates and either answer "
+            "the question directly or try something concretely different."
+        )
+    return ""
+
+
+def _parse_daily_header_ts(header: str) -> object:
+    m = re.fullmatch(r"(\d{2}):(\d{2})", header.strip())
+    if not m:
+        return None
+    today = datetime.date.today()
+    try:
+        return datetime.datetime(today.year, today.month, today.day, int(m.group(1)), int(m.group(2)))
+    except ValueError:
+        return None
+
+
+def _parse_lesson_header_ts(header: str) -> object:
+    m = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2})", header.strip())
+    if not m:
+        return None
+    try:
+        return datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
 
 
 def _today_daily_path() -> pathlib.Path:
@@ -128,8 +222,12 @@ def run_shell(args: dict) -> str:
 
 def append_daily_note(args: dict) -> str:
     text = args["text"]
-    timestamp = datetime.datetime.now().strftime("%H:%M")
     path = _ensure_today_daily_note()
+    existing = path.read_text(encoding="utf-8")
+    blocked = _write_guard(existing, text, _parse_daily_header_ts)
+    if blocked:
+        return blocked
+    timestamp = datetime.datetime.now().strftime("%H:%M")
     try:
         with path.open("a", encoding="utf-8") as f:
             f.write(f"\n## {timestamp}\n{text.rstrip(chr(10))}\n")
@@ -155,9 +253,13 @@ def append_lesson(args: dict) -> str:
     what gets logged here actually gets used, not just archived."""
     lesson = args["lesson"]
     topic = args.get("topic", "").strip()
+    path = _ensure_lessons_file()
+    existing = path.read_text(encoding="utf-8")
+    blocked = _write_guard(existing, lesson, _parse_lesson_header_ts)
+    if blocked:
+        return blocked
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     header = f"## {timestamp}" + (f" — {topic}" if topic else "")
-    path = _ensure_lessons_file()
     try:
         with path.open("a", encoding="utf-8") as f:
             f.write(f"\n{header}\n{lesson.rstrip(chr(10))}\n")
