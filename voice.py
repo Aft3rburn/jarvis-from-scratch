@@ -1,11 +1,11 @@
 """
 Voice front end for Jarvis From Scratch — v1 addition on top of the v0 text
 loop. Local only: faster-whisper on the Nvidia RTX A1000 (CUDA) for
-speech-to-text, Piper on CPU for text-to-speech. No cloud calls.
+speech-to-text, Kokoro on CPU for text-to-speech. No cloud calls.
 
 listen()  -> records from the default mic until a beat of silence, then
              transcribes and returns the text.
-speak(text) -> synthesizes text with Piper and plays it back.
+speak(text) -> synthesizes text with Kokoro and plays it back.
 """
 
 import os
@@ -38,8 +38,16 @@ os.environ["PATH"] = (
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
-from piper import PiperVoice
 from pynput import keyboard as pynput_keyboard
+
+# Kokoro phonemizes through espeak-ng. espeakng-loader ships its own DLL +
+# data dir (no system eSpeak NG install needed, unlike Piper's approach) -
+# point phonemizer at it before kokoro is ever imported. Proven live
+# 2026-09-08.
+import espeakng_loader
+os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = espeakng_loader.get_library_path()
+os.environ["PHONEMIZER_ESPEAK_PATH"] = espeakng_loader.get_data_path()
+from kokoro import KPipeline
 
 SAMPLE_RATE = 16000  # whisper's native rate
 BLOCK_MS = 30
@@ -53,12 +61,17 @@ MAX_RECORD_SECONDS = 30
 # laptop keyboards). Mark's pick: Left Ctrl.
 PTT_KEY = pynput_keyboard.Key.ctrl_l
 
-# hfc_male, not lessac - lessac didn't read as male to Mark on a live
-# listen test (2026-09-08), hfc_male is unambiguous by name.
-VOICE_MODEL_PATH = Path(__file__).parent / "voices" / "en_US-hfc_male-medium.onnx"
+# bm_lewis - Kokoro's British male voice, the same one Mary's own backtalk
+# uses (backtalk/config.py CFG["voice"]). Swapped in 2026-09-08 at Mark's
+# request: "switch him over to something like what you use" - Piper's
+# en_GB-alan-medium (still on disk in voices/, unused) was the first pass
+# at "sounds British" before Mark asked for the real thing.
+KOKORO_VOICE = "bm_lewis"
+KOKORO_LANG = KOKORO_VOICE[0]  # voice name's first letter = language pipeline
+KOKORO_RATE = 24000
 
 _whisper_model = None
-_piper_voice = None
+_kokoro_pipe = None
 
 
 def _get_whisper():
@@ -68,11 +81,11 @@ def _get_whisper():
     return _whisper_model
 
 
-def _get_piper():
-    global _piper_voice
-    if _piper_voice is None:
-        _piper_voice = PiperVoice.load(str(VOICE_MODEL_PATH), use_cuda=False)
-    return _piper_voice
+def _get_kokoro():
+    global _kokoro_pipe
+    if _kokoro_pipe is None:
+        _kokoro_pipe = KPipeline(lang_code=KOKORO_LANG)
+    return _kokoro_pipe
 
 
 def _record_until_silence() -> np.ndarray:
@@ -222,16 +235,19 @@ def strip_for_speech(text: str) -> str:
 
 
 def speak(text: str) -> None:
-    """Clean and synthesize text with Piper, then play it back."""
+    """Clean and synthesize text with Kokoro, then play it back."""
     text = strip_for_speech(text)
     if not text.strip():
         return
 
-    voice = _get_piper()
-    audio_pieces = [chunk.audio_float_array for chunk in voice.synthesize(text)]
+    pipe = _get_kokoro()
+    audio_pieces = [
+        np.asarray(audio, dtype=np.float32)
+        for _, _, audio in pipe(text, voice=KOKORO_VOICE, speed=1.0)
+    ]
     if not audio_pieces:
         return
     audio = np.concatenate(audio_pieces)
 
-    sd.play(audio, samplerate=voice.config.sample_rate)
+    sd.play(audio, samplerate=KOKORO_RATE)
     sd.wait()
