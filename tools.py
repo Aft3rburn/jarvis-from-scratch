@@ -715,6 +715,84 @@ def read_index() -> str:
     return INDEX_FILE.read_text(encoding="utf-8").strip()
 
 
+# --- Live tone control (tone_control.py's popup writes here) ---
+#
+# Five sliders, not tools.py's own decision - see tone_control.py's own
+# docstring for why the original 20-attribute rubric got collapsed to
+# five. Each is bucketed into low/mid/high rather than used as a raw
+# number: a local model can act on "be concise" vs "be elaborate" in a
+# way it almost certainly can't distinguish "6.3 concise" from "7.1
+# concise," so the fine slider position only matters for picking which
+# of three clearly-different sentences gets used.
+TONE_CONFIG_PATH = WORKSPACE / "tone_config.json"
+_TONE_DEFAULTS = {
+    "formality": 6,
+    "warmth": 6,
+    "conciseness": 8,
+    "humor": 2,
+    "confidence": 7,
+}
+_TONE_DESCRIPTIONS = {
+    "formality": {
+        "low": "Speak casually and informally - contractions are fine, keep it relaxed.",
+        "mid": "Speak in a moderately polished, professional register - not stiff, not casual.",
+        "high": "Speak formally and precisely - full grammar, no casual contractions, a polished technical register.",
+    },
+    "warmth": {
+        "low": "Stay pragmatic and detached - focus on the facts and the task, skip warmth or reassurance.",
+        "mid": "Be moderately warm - acknowledge the person without dwelling on it, then get to the point.",
+        "high": "Be warm and empathetic - acknowledge how the person might feel alongside the answer.",
+    },
+    "conciseness": {
+        "low": "Be elaborate - explain your reasoning and give full context, don't rush the answer.",
+        "mid": "Balance brevity and detail - enough context to be useful, without padding.",
+        "high": "Be concise - answer directly, minimal words, no padding or restating the question.",
+    },
+    "humor": {
+        "low": "Stay serious - no jokes, no sarcasm, straightforward delivery.",
+        "mid": "A little dry wit is fine occasionally, but don't force it.",
+        "high": "Lean into dry humor and light sarcasm where it fits naturally.",
+    },
+    "confidence": {
+        "low": "Be suggestive and open-ended - offer options rather than a single directive answer.",
+        "mid": "Give a clear recommendation but leave room for the user's judgment.",
+        "high": "Be confident, decisive, and authoritative - give one clear directive answer, not a menu of options.",
+    },
+}
+
+
+def _tone_bucket(value: float) -> str:
+    if value <= 3:
+        return "low"
+    if value <= 6:
+        return "mid"
+    return "high"
+
+
+def tone_instruction() -> str:
+    """Read tone_config.json (written live by tone_control.py's popup)
+    and return a short natural-language paragraph translating the five
+    sliders into instructions. Not a model-callable tool - read fresh by
+    _build_system_prompt() on every turn, so a slider moved mid-
+    conversation takes effect on the model's very next reply, no
+    restart needed. Falls back to the defaults if the file is missing
+    or malformed - a broken config should never crash a turn."""
+    values = dict(_TONE_DEFAULTS)
+    if TONE_CONFIG_PATH.exists():
+        try:
+            data = json.loads(TONE_CONFIG_PATH.read_text(encoding="utf-8"))
+            for k in _TONE_DEFAULTS:
+                if k in data:
+                    values[k] = data[k]
+        except (json.JSONDecodeError, OSError, TypeError):
+            pass  # fall back to defaults rather than break the turn
+
+    lines = [
+        _TONE_DESCRIPTIONS[k][_tone_bucket(values[k])] for k in _TONE_DEFAULTS
+    ]
+    return " ".join(lines)
+
+
 def recent_daily_notes(max_chars: int = 2000) -> str:
     """Return the tail of today's daily note (creating it from the
     template if this is the first run of the day), capped at max_chars.

@@ -6,3 +6,4 @@ vault/
 *.log
 scheduled_tasks/
 relay_config.json
+tone_config.json

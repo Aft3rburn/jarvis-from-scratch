@@ -99,8 +99,15 @@ def _build_system_prompt() -> str:
     recent = tools.recent_daily_notes()
     lessons = tools.recent_lessons()
     open_tasks = tools.open_tasks_section()
+    tone = tools.tone_instruction()
 
     parts = [SYSTEM_PROMPT]
+    if tone:
+        parts.append(
+            "Tone for this reply, set live by Mark via tone_control.py's "
+            "popup - follow it the same way you follow the rest of this "
+            "prompt:\n\n" + tone
+        )
     if index:
         parts.append("Vault index (identity and map):\n\n" + index)
     if open_tasks:
@@ -285,6 +292,11 @@ def run_chat() -> None:
         if user_input.lower() in ("exit", "quit"):
             print("Exiting chat.")
             return
+        # Rebuilt every turn, not just once at chat start, so a tone
+        # slider moved mid-conversation (or a lesson/task logged by a
+        # tool call this same session) actually takes effect on the
+        # very next reply instead of needing a restart.
+        messages[0]["content"] = _build_system_prompt()
         messages.append({"role": "user", "content": user_input})
         try:
             _agentic_turn(messages, speak_answer=True)
