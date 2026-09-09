@@ -195,8 +195,65 @@ def write_file(args: dict) -> str:
         return f"ERROR writing {path}: {e}"
 
 
+# Code-level gate on run_shell, added 2026-09-09 after the prompt-only
+# "warn before disruptive actions" rule was live-tested and failed twice
+# in a row (a throwaway file, asked to be deleted directly, got deleted
+# immediately with zero warning both in one-shot and interactive chat
+# mode). Matches the pattern already proven this same day with the
+# log-spam guard: this model does not reliably hold a "state it, then
+# wait" instruction on its own - the friction has to live in code, not
+# just the prompt.
+_HARD_BLOCKED_SHELL_RE = re.compile(
+    r"\b(shutdown|restart-computer|reboot)\b", re.IGNORECASE
+)
+_SOFT_BLOCKED_SHELL_RE = re.compile(
+    r"\b(rm|del|erase|remove-item|rd|rmdir|taskkill|stop-process|format)\b",
+    re.IGNORECASE,
+)
+
+
+def _log_confirmed_disruptive_action(command: str, returncode: int) -> None:
+    """Unconditional audit trail for any run_shell call that passed the
+    soft-block gate with confirmed=true. Writes directly, bypassing
+    _write_guard on purpose - an audit entry must never be silently
+    dropped as a 'duplicate', and this is a distinct action each time
+    even if the command text repeats."""
+    try:
+        path = _ensure_today_daily_note()
+        timestamp = datetime.datetime.now().strftime("%H:%M")
+        with path.open("a", encoding="utf-8") as f:
+            f.write(
+                f"\n## {timestamp} - CONFIRMED DISRUPTIVE ACTION\n"
+                f"Ran with confirmed=true: `{command}` (exit code {returncode})\n"
+            )
+    except Exception:
+        pass  # never let audit logging break the actual tool result
+
+
 def run_shell(args: dict) -> str:
     command = args["command"]
+    confirmed = bool(args.get("confirmed", False))
+
+    if _HARD_BLOCKED_SHELL_RE.search(command):
+        return (
+            "BLOCKED: this command can reboot, shut down, or restart this "
+            "machine. That is never allowed through run_shell, confirmed "
+            "or not - see the 2026-09-09 unwarned-reboot incident in "
+            "INDEX.md. If Mark genuinely needs this machine rebooted, tell "
+            "him to do it himself or ask Mary. Don't retry this command."
+        )
+
+    if _SOFT_BLOCKED_SHELL_RE.search(command) and not confirmed:
+        return (
+            "BLOCKED: this command has a real, hard-to-reverse side effect "
+            "(deleting a file, killing a process, or similar). It was NOT "
+            "run. Answer directly now (no more tool calls this turn) "
+            "stating the exact command and exactly what it will do, then "
+            "wait for Mark to actually reply yes. Only if he does, call "
+            "run_shell again with this exact same command and "
+            "confirmed=true - not before."
+        )
+
     try:
         result = subprocess.run(
             command,
@@ -213,6 +270,8 @@ def run_shell(args: dict) -> str:
             pieces.append(f"stdout:\n{out}")
         if err:
             pieces.append(f"stderr:\n{err}")
+        if confirmed and _SOFT_BLOCKED_SHELL_RE.search(command):
+            _log_confirmed_disruptive_action(command, result.returncode)
         return "\n".join(pieces)
     except subprocess.TimeoutExpired:
         return "ERROR: command timed out after 30s"
@@ -725,11 +784,15 @@ SCHEMAS = [
         "type": "function",
         "function": {
             "name": "run_shell",
-            "description": "Run a shell command in the agent's workspace and return its exit code, stdout, and stderr.",
+            "description": "Run a shell command in the agent's workspace and return its exit code, stdout, and stderr. Rebooting/shutting down the machine is never allowed, no exceptions. A command that deletes a file, kills a process, or has another real hard-to-reverse side effect gets blocked on the first call - state the exact consequence to Mark as your answer (no more tool calls that turn) and wait for him to actually say yes. Only if he does, call this again with the same command and confirmed=true.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "The shell command to execute."},
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": "Set true only on a retry, only after Mark has explicitly replied yes to a consequence you already stated to him. Never set true on a first attempt.",
+                    },
                 },
                 "required": ["command"],
             },
