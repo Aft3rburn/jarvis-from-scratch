@@ -8,6 +8,7 @@ raw repr.
 """
 
 import datetime
+import json
 import pathlib
 import re
 import subprocess
@@ -331,6 +332,43 @@ def run_subagent(args: dict) -> str:
     return "ERROR: subagent finished without a final answer."
 
 
+RELAY_CONFIG_FILE = WORKSPACE / "relay_config.json"
+
+
+def relay_send(args: dict) -> str:
+    """Send a message to another machine's Mary over the LAN relay - the
+    exact same wire protocol Mary's own machines already use for this
+    (see start_relay_server() in backtalk/main.py, mary-relay-send.ps1):
+    an HTTP POST to /relay with an X-Relay-Secret header and a JSON
+    {"text": ...} body. Reads this machine's own relay_config.json for
+    the shared secret and the target's address."""
+    to = args["to"]
+    text = args["text"]
+    if not RELAY_CONFIG_FILE.exists():
+        return "ERROR: relay_config.json not found - relay isn't set up on this machine."
+    try:
+        cfg = json.loads(RELAY_CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        return f"ERROR reading relay_config.json: {e}"
+    if not cfg.get("secret"):
+        return "ERROR: relay isn't configured (no secret set)."
+    peers = cfg.get("peers", {})
+    target = peers.get(to)
+    if not target:
+        known = ", ".join(peers) or "(none)"
+        return f"ERROR: no peer named {to!r}. Known peers: {known}"
+    try:
+        resp = httpx.post(
+            f"http://{target}/relay",
+            json={"text": text},
+            headers={"X-Relay-Secret": cfg["secret"]},
+            timeout=10,
+        )
+    except Exception as e:
+        return f"ERROR sending to {to} ({target}): {e}"
+    return f"OK: sent to {to} ({target}), HTTP {resp.status_code}"
+
+
 def schedule_task(args: dict) -> str:
     """Register a real one-time Windows Scheduled Task that fires Jarvis
     (one-shot, --speak mode) with the given task text at the given date and
@@ -420,6 +458,7 @@ REGISTRY = {
     "web_fetch": web_fetch,
     "run_subagent": run_subagent,
     "schedule_task": schedule_task,
+    "relay_send": relay_send,
 }
 
 # Ollama/OpenAI-style function schemas, sent to the model so it knows what's
@@ -584,6 +623,21 @@ SCHEMAS = [
                     "task": {"type": "string", "description": "The self-contained task for the subagent to work."},
                 },
                 "required": ["task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "relay_send",
+            "description": "Send a message to another machine's Mary over the LAN relay. Use this to pass information or a request to Mark's other assistant instances.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string", "description": "Name of the peer to send to, e.g. 'VR2026' or 'AI-Server'. Must be a name already known in relay_config.json's peers."},
+                    "text": {"type": "string", "description": "The message text to send."},
+                },
+                "required": ["to", "text"],
             },
         },
     },

@@ -5,3 +5,4 @@ voices/
 vault/
 *.log
 scheduled_tasks/
+relay_config.json
