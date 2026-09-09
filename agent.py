@@ -25,7 +25,7 @@ import voice
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL = "qwen3-coder:30b"
-MAX_STEPS = 10
+MAX_STEPS = 30
 
 # Sometimes the model writes a tool call out as plain text (e.g.
 # "<function=append_memory>...") instead of using Ollama's real structured
@@ -205,11 +205,37 @@ def run_task(task: str, speak_answer: bool = False) -> None:
             voice.speak("I can't reach Ollama right now. Is it running?")
 
 
+def _startup_sitrep() -> None:
+    """Speak a short sitrep the moment an interactive session starts,
+    instead of sitting silent waiting for input - mirrors Mary's own
+    welcome-line behavior. Runs one throwaway agentic turn off a
+    synthetic prompt, using whatever's already auto-loaded into the
+    system prompt (today's daily note, recent lessons, the index)."""
+    messages = [
+        {"role": "system", "content": _build_system_prompt()},
+        {
+            "role": "user",
+            "content": (
+                "Before I ask anything, give me a short spoken sitrep: "
+                "based on today's daily note and recent lessons, what's "
+                "still open or in progress, and anything worth flagging. "
+                "A couple of plain spoken sentences, nothing formal, no "
+                "question at the end - just the status."
+            ),
+        },
+    ]
+    try:
+        _agentic_turn(messages, speak_answer=True, allowed_tools=set())
+    except OllamaUnavailable as e:
+        print(f"\n=== error ===\n{e}")
+
+
 def run_chat() -> None:
     """Multi-turn text chat: one conversation that keeps growing across
     turns, like typing into this very terminal - not a fresh start every
     message the way run_task is."""
     start_relay_server()
+    _startup_sitrep()
     messages = [{"role": "system", "content": _build_system_prompt()}]
     print("Chat mode. Type 'exit' or 'quit' to leave.")
     while True:
@@ -236,6 +262,7 @@ def run_voice_loop() -> None:
     """Push-to-talk loop: hold the PTT key, speak your task, release, get a
     spoken answer, repeat. Ctrl+C to exit."""
     start_relay_server()
+    _startup_sitrep()
     print(f"Voice mode (push-to-talk, {voice.PTT_KEY}). Ctrl+C to exit.")
     while True:
         text = voice.listen_ptt()
