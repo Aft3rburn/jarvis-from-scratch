@@ -29,8 +29,17 @@ WORKSPACE = pathlib.Path(__file__).parent.resolve()
 VAULT_DIR = WORKSPACE / "vault"
 INDEX_FILE = VAULT_DIR / "INDEX.md"
 DAILY_DIR = VAULT_DIR / "daily"
+LESSONS_FILE = VAULT_DIR / "LESSONS.md"
 
 DAILY_TEMPLATE = "# {date}\n\n"
+LESSONS_TEMPLATE = (
+    "# Lessons Learned\n\n"
+    "A running chronicle of real fixes, working methods, and dead ends to\n"
+    "skip - separate from the daily notes, which log what happened. This\n"
+    "file logs what was learned, so a later run doesn't pay the discovery\n"
+    "tax twice. Append with `append_lesson`; a tail of this file is "
+    "auto-loaded into every run, same as INDEX.md.\n"
+)
 
 
 def _today_daily_path() -> pathlib.Path:
@@ -113,6 +122,47 @@ def append_daily_note(args: dict) -> str:
         return f"OK: appended {len(text)} chars to {path.relative_to(WORKSPACE)}"
     except Exception as e:
         return f"ERROR appending to daily note: {e}"
+
+
+def _ensure_lessons_file() -> pathlib.Path:
+    """Auto-create LESSONS.md from a minimal template if it doesn't exist
+    yet - mirrors the daily note's own 'create from template if
+    missing' habit."""
+    if not LESSONS_FILE.exists():
+        VAULT_DIR.mkdir(parents=True, exist_ok=True)
+        LESSONS_FILE.write_text(LESSONS_TEMPLATE, encoding="utf-8")
+    return LESSONS_FILE
+
+
+def append_lesson(args: dict) -> str:
+    """Log a real fix, working method, or dead end to skip - not a daily
+    journal entry, a durable lesson meant to change future behavior. A
+    tail of this file is auto-loaded into every run's system prompt, so
+    what gets logged here actually gets used, not just archived."""
+    lesson = args["lesson"]
+    topic = args.get("topic", "").strip()
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    header = f"## {timestamp}" + (f" — {topic}" if topic else "")
+    path = _ensure_lessons_file()
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(f"\n{header}\n{lesson.rstrip(chr(10))}\n")
+        return f"OK: logged a lesson to {path.relative_to(WORKSPACE)}"
+    except Exception as e:
+        return f"ERROR appending lesson: {e}"
+
+
+def recent_lessons(max_chars: int = 2000) -> str:
+    """Return the tail of LESSONS.md, or '' if nothing's been logged yet.
+    Not a model-callable tool - used by the agent loop to auto-load past
+    lessons at the start of every run, same principle as
+    recent_daily_notes: don't rely on the model remembering to go look."""
+    if not LESSONS_FILE.exists():
+        return ""
+    text = LESSONS_FILE.read_text(encoding="utf-8").strip()
+    if not text:
+        return ""
+    return text[-max_chars:] if len(text) > max_chars else text
 
 
 def search_vault(args: dict) -> str:
@@ -362,6 +412,7 @@ REGISTRY = {
     "write_file": write_file,
     "run_shell": run_shell,
     "append_daily_note": append_daily_note,
+    "append_lesson": append_lesson,
     "search_vault": search_vault,
     "glob_files": glob_files,
     "search_files": search_files,
@@ -428,6 +479,21 @@ SCHEMAS = [
                     "text": {"type": "string", "description": "Text to append."},
                 },
                 "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "append_lesson",
+            "description": "Log a real fix, working method, or dead end to skip - a durable lesson meant to change future behavior, not a daily journal entry. Use this whenever you discover something worth remembering next time, not just what happened today.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "lesson": {"type": "string", "description": "The lesson itself: what worked, what didn't, and why."},
+                    "topic": {"type": "string", "description": "Optional short topic label, e.g. 'scheduling' or 'ollama'."},
+                },
+                "required": ["lesson"],
             },
         },
     },

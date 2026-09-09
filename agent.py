@@ -41,17 +41,22 @@ SYSTEM_PROMPT = (
     "yourself. Use tools whenever a task needs real information or a real "
     "action instead of guessing. Chain multiple tool calls when a task "
     "needs more than one step. When you have enough information to fully "
-    "answer, respond with plain text and no further tool calls."
+    "answer, respond with plain text and no further tool calls.\n\n"
+    "Whenever you find a real fix, a working method, or a dead end worth "
+    "ruling out for next time, call append_lesson to record it - not "
+    "every little thing, just what would actually save time if you (or a "
+    "later run) hit the same problem again."
 )
 
 
 def _build_system_prompt() -> str:
-    """Base system prompt plus the vault's INDEX.md and a tail of today's
-    daily note, auto-loaded so identity and recent context are there from
-    the first message instead of depending on the model remembering to
-    call search_vault."""
+    """Base system prompt plus the vault's INDEX.md, a tail of today's
+    daily note, and a tail of LESSONS.md, auto-loaded so identity, recent
+    context, and past lessons are all there from the first message instead
+    of depending on the model remembering to call search_vault."""
     index = tools.read_index()
     recent = tools.recent_daily_notes()
+    lessons = tools.recent_lessons()
 
     parts = [SYSTEM_PROMPT]
     if index:
@@ -62,6 +67,13 @@ def _build_system_prompt() -> str:
             "user's question, answer directly from it - do not call "
             "search_vault for something already shown here. Only use "
             "search_vault for older facts not covered below.\n\n" + recent
+        )
+    if lessons:
+        parts.append(
+            "Lessons learned from past runs - real fixes, working "
+            "methods, and dead ends already ruled out. Don't repeat a "
+            "mistake or re-discover something already logged here.\n\n"
+            + lessons
         )
     return "\n\n".join(parts)
 
