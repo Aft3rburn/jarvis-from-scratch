@@ -833,6 +833,56 @@ def set_tone(args: dict) -> str:
     return f"OK: tone updated ({summary}). This takes effect starting with your next reply."
 
 
+# --- Visual face (visualizer/, a separate copy of Mary's ai-visualizer
+# engine - see Local Mary Clone Session 32) ---
+VISUALIZER_DIR = WORKSPACE / "visualizer"
+VISUALIZER_CONFIG_PATH = VISUALIZER_DIR / "ai-visualizer.json"
+
+
+def list_faces(args: dict | None = None) -> str:
+    """List the face folders actually available in your own gallery
+    (visualizer/faces/), and which one is active right now. You do
+    have a real visual face - see the 'Your visual face' section in
+    this file's own INDEX.md if you're ever unsure."""
+    faces_dir = VISUALIZER_DIR / "faces"
+    if not faces_dir.is_dir():
+        return "No faces/ folder found under visualizer/ - something's wrong with the visualizer install."
+    names = sorted(p.name for p in faces_dir.iterdir() if p.is_dir() and (p / "index.html").exists())
+    if not names:
+        return "No faces exist yet in visualizer/faces/."
+    active = ""
+    try:
+        active = json.loads(VISUALIZER_CONFIG_PATH.read_text(encoding="utf-8")).get("face", "")
+    except (OSError, json.JSONDecodeError):
+        pass
+    return "Available faces: " + ", ".join(names) + f". Active: {active or '(none set)'}"
+
+
+def set_face(args: dict) -> str:
+    """Switch your active visual face to one already present in
+    visualizer/faces/ (call list_faces first if you don't know what's
+    there). Edits visualizer/ai-visualizer.json's 'face' field - takes
+    effect the next time the face page is opened/refreshed in a
+    browser, no restart of you needed."""
+    name = str(args.get("face", "")).strip()
+    if not name:
+        return "ERROR: no face name given."
+    face_dir = VISUALIZER_DIR / "faces" / name
+    if not (face_dir / "index.html").exists():
+        return f"ERROR: no face named '{name}' in visualizer/faces/ - call list_faces to see what's actually there."
+    try:
+        cfg = json.loads(VISUALIZER_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        cfg = {}
+    old = cfg.get("face", "")
+    cfg["face"] = name
+    try:
+        VISUALIZER_CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    except OSError as e:
+        return f"ERROR writing ai-visualizer.json: {e}"
+    return f"OK: active face switched {old!r} -> {name!r}. Refresh the face's browser tab to see it."
+
+
 def recent_daily_notes(max_chars: int = 2000) -> str:
     """Return the tail of today's daily note (creating it from the
     template if this is the first run of the day), capped at max_chars.
@@ -865,6 +915,8 @@ REGISTRY = {
     "schedule_task": schedule_task,
     "relay_send": relay_send,
     "set_tone": set_tone,
+    "list_faces": list_faces,
+    "set_face": set_face,
 }
 
 # Ollama/OpenAI-style function schemas, sent to the model so it knows what's
@@ -1102,6 +1154,28 @@ SCHEMAS = [
                     "humor": {"type": "number", "description": "0 (serious) to 10 (playful/sarcastic). Omit to leave unchanged."},
                     "confidence": {"type": "number", "description": "0 (suggestive) to 10 (authoritative/decisive). Omit to leave unchanged."},
                 },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_faces",
+            "description": "List the visual faces actually available in your own gallery (visualizer/faces/) and which one is active. You have a real visual face - never claim you're text-only or have no visual presence, check here first.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_face",
+            "description": "Switch your active visual face to one already in visualizer/faces/ (call list_faces first to see real options). Takes effect the next time the face's browser tab is refreshed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "face": {"type": "string", "description": "Name of an existing folder under visualizer/faces/, e.g. 'jarvis' or 'orbit'."},
+                },
+                "required": ["face"],
             },
         },
     },
