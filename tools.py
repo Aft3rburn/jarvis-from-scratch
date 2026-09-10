@@ -19,6 +19,8 @@ import uuid
 
 import httpx
 
+import ops_monitor
+
 # Everything the agent touches is scoped under this folder so a stray tool
 # call can't wander the whole filesystem. Paths passed by the model are
 # resolved relative to here unless already absolute.
@@ -303,6 +305,27 @@ def run_shell(args: dict) -> str:
         return "ERROR: command timed out after 30s"
     except Exception as e:
         return f"ERROR running command: {e}"
+
+
+# Confirm gate on ops_monitor.restart_hung_process, added 2026-09-10 as
+# part of wiring the four-part roadmap's ops-monitoring item into the live
+# agent. Same soft-block pattern as run_shell's own disruptive-action
+# gate: killing a real process is a real, hard-to-reverse action, so it
+# doesn't get exposed unconfirmed even though it's a narrower, named tool
+# rather than an arbitrary shell command.
+def restart_hung_process(args: dict) -> str:
+    process_name = args.get("process_name") if args else None
+    confirmed = bool(args.get("confirmed", False)) if args else False
+    if process_name and not confirmed:
+        return (
+            f"BLOCKED: this would kill every '{process_name}' process and "
+            "relaunch it - a real, hard-to-reverse action. It was NOT run. "
+            "Answer directly now (no more tool calls this turn) stating "
+            "exactly what you're restarting and why, then wait for Mark to "
+            "actually reply yes. Only if he does, call restart_hung_process "
+            "again with the same arguments plus confirmed=true - not before."
+        )
+    return ops_monitor.restart_hung_process(args)
 
 
 def append_daily_note(args: dict) -> str:
@@ -1127,6 +1150,11 @@ REGISTRY = {
     "list_faces": list_faces,
     "set_face": set_face,
     "show_face": show_face,
+    "check_disk": ops_monitor.check_disk,
+    "check_scheduled_tasks": ops_monitor.check_scheduled_tasks,
+    "check_gpu_nvidia": ops_monitor.check_gpu_nvidia,
+    "check_gpu_amd": ops_monitor.check_gpu_amd,
+    "restart_hung_process": restart_hung_process,
 }
 
 # Ollama/OpenAI-style function schemas, sent to the model so it knows what's
@@ -1403,6 +1431,67 @@ SCHEMAS = [
             "name": "show_face",
             "description": "Bring your own face's browser window to the front and center of the screen. Opens one first if none is currently open.",
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_disk",
+            "description": "Report free/total disk space on a drive. Use for a 'how much disk space is left' style question.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "drive": {"type": "string", "description": "Drive letter with trailing backslash, e.g. 'C:\\\\'. Defaults to C:\\ if omitted."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_scheduled_tasks",
+            "description": "Report last-run time and result for scheduled tasks matching a name pattern - use for 'check your backup status' or similar status questions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regex pattern matched against task names, e.g. 'Jarvis' or 'Jarvis|Mary'. Defaults to 'Jarvis' if omitted."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_gpu_nvidia",
+            "description": "Report the Nvidia GPU's name, temperature, utilization, and memory use via nvidia-smi.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_gpu_amd",
+            "description": "Report total GPU 3D-engine utilization across all GPUs on this machine (AMD 7900 XT + Nvidia A1000 combined - no per-vendor split, no temperature available). Use for a general 'check the gpu' question; use check_gpu_nvidia instead if specifically asked about the Nvidia card.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "restart_hung_process",
+            "description": "Kill every process matching a name and relaunch it with a given command - use to restart something stuck or unresponsive (e.g. the visualizer). A real, hard-to-reverse action: blocked on the first call - state exactly what you're restarting and why, wait for Mark to say yes, then retry with confirmed=true.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "process_name": {"type": "string", "description": "Process name to kill, e.g. 'ollama' (no .exe suffix needed)."},
+                    "relaunch_command": {"type": "string", "description": "Shell command to relaunch it, e.g. the path to its .bat or .exe."},
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": "Set true only on a retry, only after Mark has explicitly replied yes to a restart you already stated to him. Never set true on a first attempt.",
+                    },
+                },
+                "required": ["process_name", "relaunch_command"],
+            },
         },
     },
     {

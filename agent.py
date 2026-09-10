@@ -21,12 +21,50 @@ import urllib.error
 import urllib.request
 
 import bus
+import router
 import tools
 import voice
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL = "qwen3-coder:30b"
 MAX_STEPS = 30
+
+# Fast lane, item 3 of the 2026-09-10 four-part roadmap. A second Ollama
+# instance, pinned to the Nvidia RTX A1000 via OLLAMA_LLM_LIBRARY=cuda_v13
+# (started by "Fast Ollama Autostart.bat" in the Startup folder) so it
+# never contends with the 7900 XT running MODEL above. Real finding this
+# session: sharing one GPU between the two overcommitted its 20GB VRAM and
+# made a 3B model take 80 SECONDS to answer "what time is it" - isolating
+# it on the second card fixed that (5.3s cold, 3.4s warm). Only used for
+# requests router.classify() marks FAST; anything else stays on MODEL.
+FAST_OLLAMA_URL = "http://127.0.0.1:11435/api/chat"
+FAST_MODEL = "llama3.2:3b"
+
+# Tools safe to expose to the fast-lane model: read-only status checks and
+# the visual face, nothing that writes, executes, or has a side effect.
+# Same tightened-leash principle as RELAY_SAFE_TOOLS below - a smaller,
+# weaker model handling a request with less oversight (no full vault/task
+# context loaded, see FAST_SYSTEM_PROMPT) shouldn't have write/shell/
+# scheduling/relay access.
+FAST_SAFE_TOOLS = {
+    "check_disk", "check_scheduled_tasks", "check_gpu_nvidia",
+    "check_gpu_amd", "list_open_tasks", "list_faces", "set_face",
+    "show_face",
+}
+
+# Deliberately short - no vault/task/lesson dump like _build_system_prompt().
+# The whole point of the fast lane is low latency; a long system prompt
+# would cost prompt-eval time on every single call and defeat that.
+FAST_SYSTEM_PROMPT = (
+    "You are a fast local voice assistant handling a short, simple, "
+    "bounded command or status check - not a full conversation. You have "
+    "a few tools to check disk space, GPU status, scheduled tasks, open "
+    "tasks, and your own visual face; use one if the request actually "
+    "needs real data, otherwise just answer directly. One short spoken "
+    "sentence. No markdown, no lists, no explanation beyond the answer "
+    "itself. If you genuinely don't know something (e.g. the weather, "
+    "with no tool for it), say so plainly instead of guessing."
+)
 
 # Sometimes the model writes a tool call out as plain text (e.g.
 # "<function=append_memory>...") instead of using Ollama's real structured
@@ -143,33 +181,42 @@ class OllamaUnavailable(Exception):
     plain message instead of a raw connection-refused traceback."""
 
 
-def call_ollama(messages: list, allowed_tools: set | None = None) -> dict:
+def call_ollama(
+    messages: list,
+    allowed_tools: set | None = None,
+    model: str = MODEL,
+    url: str = OLLAMA_URL,
+) -> dict:
     schemas = tools.SCHEMAS
     if allowed_tools is not None:
         schemas = [s for s in schemas if s["function"]["name"] in allowed_tools]
     payload = {
-        "model": MODEL,
+        "model": model,
         "messages": messages,
         "tools": schemas,
         "stream": False,
     }
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        OLLAMA_URL, data=data, headers={"Content-Type": "application/json"}
+        url, data=data, headers={"Content-Type": "application/json"}
     )
     try:
         with urllib.request.urlopen(req, timeout=180) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.URLError as e:
         raise OllamaUnavailable(
-            f"Can't reach Ollama at {OLLAMA_URL} ({e.reason}). "
+            f"Can't reach Ollama at {url} ({e.reason}). "
             "Is the Ollama server running? Try 'ollama serve' or check the "
             "Ollama Auto-Start scheduled task."
         ) from e
 
 
 def _agentic_turn(
-    messages: list, speak_answer: bool = False, allowed_tools: set | None = None
+    messages: list,
+    speak_answer: bool = False,
+    allowed_tools: set | None = None,
+    model: str = MODEL,
+    url: str = OLLAMA_URL,
 ) -> None:
     """Run the ask-model / execute-tools loop, appending to `messages` in
     place, until the model gives a final text answer (or MAX_STEPS is
@@ -201,8 +248,8 @@ def _agentic_turn(
     MAX_GIVE_UP_RETRIES = 2
 
     for step in range(1, MAX_STEPS + 1):
-        print(f"\n--- step {step}: asking {MODEL} ---")
-        response = call_ollama(messages, allowed_tools)
+        print(f"\n--- step {step}: asking {model} ---")
+        response = call_ollama(messages, allowed_tools, model=model, url=url)
         message = response["message"]
         messages.append(message)
 
@@ -343,7 +390,27 @@ def _agentic_turn(
 
 
 def run_task(task: str, speak_answer: bool = False) -> None:
-    """One-shot: fresh conversation, single task, then exit."""
+    """One-shot: fresh conversation, single task, then exit. Routes
+    through the fast lane (small model, isolated Nvidia GPU, tight tool
+    leash, no vault dump) when router.classify() marks the request FAST -
+    see FAST_OLLAMA_URL's own comment for why. Falls through to the full
+    model if the fast lane's own Ollama instance isn't reachable, rather
+    than failing the request outright."""
+    if router.classify(task) == router.FAST:
+        print(f"\n[router] classified FAST -> {FAST_MODEL} on the isolated GPU")
+        fast_messages = [
+            {"role": "system", "content": FAST_SYSTEM_PROMPT},
+            {"role": "user", "content": task},
+        ]
+        try:
+            _agentic_turn(
+                fast_messages, speak_answer, allowed_tools=FAST_SAFE_TOOLS,
+                model=FAST_MODEL, url=FAST_OLLAMA_URL,
+            )
+            return
+        except OllamaUnavailable as e:
+            print(f"\n[router] fast lane unreachable ({e}), falling back to {MODEL}")
+
     messages = [
         {"role": "system", "content": _build_system_prompt()},
         {"role": "user", "content": task},
