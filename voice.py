@@ -61,12 +61,14 @@ MAX_RECORD_SECONDS = 30
 # laptop keyboards). Mark's pick: Left Ctrl.
 PTT_KEY = pynput_keyboard.Key.ctrl_l
 
-# bm_lewis - Kokoro's British male voice, the same one Mary's own backtalk
-# uses (backtalk/config.py CFG["voice"]). Swapped in 2026-09-08 at Mark's
-# request: "switch him over to something like what you use" - Piper's
-# en_GB-alan-medium (still on disk in voices/, unused) was the first pass
-# at "sounds British" before Mark asked for the real thing.
-KOKORO_VOICE = "bm_lewis"
+# bm_fable - Kokoro British male voice. Chosen 2026-09-09 after Mark asked
+# for something more youthful, mid-30s British male; he A/B'd all four
+# Kokoro British male voices (daniel/fable/george/lewis) played back to
+# back through the speakers and picked fable by ear - Kokoro publishes no
+# age/character metadata, so this wasn't guessed from documentation.
+# Previously bm_lewis (Mary's own backtalk voice, swapped in 2026-09-08);
+# before that, Piper's en_GB-alan-medium (still on disk in voices/, unused).
+KOKORO_VOICE = "bm_fable"
 KOKORO_LANG = KOKORO_VOICE[0]  # voice name's first letter = language pipeline
 KOKORO_RATE = 24000
 
