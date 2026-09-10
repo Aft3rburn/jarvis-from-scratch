@@ -8,22 +8,13 @@ checks are exactly what a smaller model handles reliably, and it takes
 real work off Mary's own sitrep-checking plate (she currently checks
 these same scheduled tasks by hand every session).
 
-*** NOT YET WIRED INTO tools.py. *** Same reasoning as router.py: adding
-these to tools.REGISTRY/SCHEMAS is a real edit to a live production file
-and needs Mark's explicit confirm, plus live verification the GPU checks
-below actually parse real rocm-smi/nvidia-smi output on AI-Server's actual
-hardware (this machine, ADLAPTOPMAX, isn't a confirmed match for that
-GPU setup, so those two functions are UNVERIFIED - everything else here
-(disk, scheduled tasks) uses plain OS-level calls that work identically
-on any Windows box and this session DID run and confirm them for real,
-noted per-function below).
-
-Every function follows tools.py's existing shape: takes a single dict of
-args, returns a plain string meant to go straight back into the model's
-tool-result channel - so integration is a copy-paste into tools.py plus
-matching REGISTRY/SCHEMAS entries, not a rewrite.
+Wired into tools.py's REGISTRY/SCHEMAS 2026-09-10, verified live on real
+AI-Server hardware. disk/scheduled-tasks/nvidia GPU checks all confirmed
+against real output that session. AMD GPU check is a real, honest
+exception - see check_gpu_amd's own docstring.
 """
 
+import re
 import shutil
 import subprocess
 
@@ -51,8 +42,15 @@ def _run_ps(script: str, timeout: int = 10) -> str:
 
 def check_disk(args: dict) -> str:
     """Report free/total space on a drive. args: {"drive": "C:\\\\"}
-    (optional, defaults to C:\\)."""
+    (optional, defaults to C:\\). Real bug caught live 2026-09-10: the
+    fast-lane 3B model garbled the schema's escaped example and passed
+    'C\\' (letter + backslash, no colon) instead of 'C:\\' - normalize
+    a bare-letter-plus-backslash drive argument instead of trusting a
+    small model to reproduce JSON escaping exactly."""
     drive = args.get("drive", "C:\\") if args else "C:\\"
+    m = re.fullmatch(r"([A-Za-z])\\?", drive)
+    if m:
+        drive = f"{m.group(1)}:\\"
     try:
         usage = shutil.disk_usage(drive)
     except OSError as e:
@@ -77,8 +75,10 @@ def check_disk(args: dict) -> str:
 
 _CHECK_TASKS_PS_TEMPLATE = (
     "Get-ScheduledTask | Where-Object {{ $_.TaskName -match '{pattern}' }} | "
-    "Get-ScheduledTaskInfo | Select-Object TaskName, LastRunTime, LastTaskResult "
-    "| ConvertTo-Json -Compress"
+    "Get-ScheduledTaskInfo | Select-Object TaskName, "
+    "@{{Name='LastRunTime';Expression={{ if ($_.LastRunTime) "
+    "{{ $_.LastRunTime.ToString('yyyy-MM-dd HH:mm') }} else {{ 'never' }} }}}}, "
+    "LastTaskResult | ConvertTo-Json -Compress"
 )
 
 
@@ -115,36 +115,68 @@ def check_scheduled_tasks(args: dict) -> str:
 
 
 # --- GPU (AMD ROCm / Nvidia) ---------------------------------------------
-# *** UNVERIFIED *** - not tested against real hardware this session.
-# ADLAPTOPMAX isn't confirmed to have the same 7900 XT + A1000 setup as
-# AI-Server. rocm-smi's exact CSV column layout in particular needs a
-# real live check before this is trusted - written from documented
-# rocm-smi/nvidia-smi flag behavior, not run against real output.
+# Verified live on real AI-Server hardware, 2026-09-10 - real, honest
+# finding along the way: rocm-smi doesn't exist anywhere on this box.
+# AMD's Windows ROCm 7.2 install here is the HIP/compiler dev toolkit
+# (hipcc, rocgdb, clang...), not a monitoring CLI - rocm-smi/amd-smi are
+# Linux-only tools AMD doesn't ship for Windows at all. Confirmed by
+# searching the entire ROCm install tree for any *smi* binary - none
+# exist. check_gpu_amd below is a real replacement using Windows' own
+# built-in GPU Engine performance counters instead, not a rocm-smi
+# wrapper.
 
 def check_gpu_amd(args: dict) -> str:
-    """UNVERIFIED - report AMD GPU temp/utilization via rocm-smi. Needs a
-    real run on AI-Server to confirm rocm-smi's actual CSV column order
-    on that box before this is trusted (rocm-smi's output layout can
-    vary by driver version)."""
-    out = _run_ps(
-        'rocm-smi --showtemp --showuse --csv 2>&1'
+    """Report total GPU 3D-engine utilization via Windows' built-in
+    performance counters, since rocm-smi doesn't exist on this Windows
+    box (see module note above). Real, honest limitation: this counter
+    is system-wide across every GPU (AMD 7900 XT + the Nvidia A1000
+    both), not filtered to the AMD card alone - Windows doesn't expose a
+    per-vendor breakdown without vendor SDK code, which wasn't worth
+    pulling in for this pass. Cross-check against check_gpu_nvidia's
+    number if you need to know how much of the total is the Nvidia
+    card. No temperature - Windows has no built-in GPU temp counter, and
+    without rocm-smi there's no AMD-provided way to read it on this box;
+    that's a real gap, not an oversight."""
+    ps = (
+        "$s = (Get-Counter '\\GPU Engine(*engtype_3D)\\Utilization Percentage' "
+        "-ErrorAction SilentlyContinue).CounterSamples | "
+        "Measure-Object -Property CookedValue -Sum; "
+        "if ($s) { [math]::Round($s.Sum, 1) } else { 'ERROR' }"
     )
-    if out.startswith("__ERROR__") or "not recognized" in out.lower():
-        return "ERROR: rocm-smi not found or failed to run - check it's on PATH."
-    return f"UNVERIFIED raw rocm-smi output (needs real parsing once column layout is confirmed live): {out}"
+    out = _run_ps(ps)
+    if not out or out == "ERROR" or out.startswith("__ERROR__"):
+        return "ERROR: couldn't read GPU utilization via Windows performance counters."
+    return (
+        f"Total GPU 3D-engine utilization (all GPUs combined, AMD 7900 XT "
+        f"+ Nvidia A1000): {out}%. No per-vendor split and no temperature "
+        f"available without rocm-smi, which isn't installed on this "
+        f"Windows box - see check_gpu_nvidia for the Nvidia card's own "
+        f"temp/utilization/memory specifically."
+    )
 
 
 def check_gpu_nvidia(args: dict) -> str:
-    """UNVERIFIED - report Nvidia GPU temp/utilization via nvidia-smi.
-    Same caveat as check_gpu_amd: written from documented nvidia-smi
-    flag behavior, needs a real run on AI-Server to confirm before use."""
+    """Report Nvidia GPU temp/utilization/memory via nvidia-smi. Verified
+    live on real AI-Server hardware, 2026-09-10 - confirmed real output
+    against the RTX A1000 actually installed there. Real bug caught in
+    the same live test: nvidia-smi's raw CSV row (bare numbers, no
+    labels) got the small fast-lane model to answer "running at 75%
+    temperature" - it mixed up which column was which. Fixed by labeling
+    every field explicitly instead of returning the bare CSV."""
     out = _run_ps(
         "nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total "
-        "--format=csv,noheader"
+        "--format=csv,noheader,nounits"
     )
     if out.startswith("__ERROR__") or "not recognized" in out.lower():
         return "ERROR: nvidia-smi not found or failed to run - check it's on PATH."
-    return out
+    parts = [p.strip() for p in out.split(",")]
+    if len(parts) != 5:
+        return f"ERROR: unexpected nvidia-smi output format: {out}"
+    name, temp_c, util_pct, mem_used, mem_total = parts
+    return (
+        f"{name}: temperature {temp_c}C, utilization {util_pct}%, "
+        f"memory {mem_used}MiB used of {mem_total}MiB total"
+    )
 
 
 # --- Hung process restart -------------------------------------------------

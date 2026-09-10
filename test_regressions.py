@@ -189,7 +189,7 @@ class _ScriptedOllama:
         self._responses = list(responses)
         self.calls = 0
 
-    def __call__(self, messages, allowed_tools=None):
+    def __call__(self, messages, allowed_tools=None, model=None, url=None):
         if not self._responses:
             raise AssertionError(
                 f"_ScriptedOllama exhausted after {self.calls} calls - "
@@ -323,6 +323,39 @@ class TestZeroToolsEnforcement(unittest.TestCase):
             "rejected with an error result and fed back, not run.",
         )
         self.assertEqual(messages[-1]["content"], "Everything's quiet, nothing open.")
+
+
+class TestOpsMonitorInputHardening(unittest.TestCase):
+    """Two real bugs caught live 2026-09-10 wiring the ops-monitor tools
+    into the fast-lane router: the small model garbled a tool argument,
+    and misread an unlabeled tool result. Both are model-reliability
+    failures, not one-off flukes - worth locking down so a future change
+    to either function doesn't quietly bring them back."""
+
+    def test_check_disk_normalizes_garbled_drive_arg(self):
+        """llama3.2:3b, asked to check disk space, called check_disk with
+        drive='C\\' (letter + backslash, no colon) - it garbled the
+        schema's escaped 'C:\\\\' example. Must resolve to the real C:
+        drive instead of erroring out."""
+        import ops_monitor
+        result = ops_monitor.check_disk({"drive": "C\\"})
+        self.assertNotIn("ERROR", result)
+        self.assertIn("free", result)
+
+    def test_check_gpu_nvidia_output_is_labeled_not_bare_csv(self):
+        """The same model, given nvidia-smi's bare CSV output with no
+        field labels, answered 'running at 75% temperature' - it mixed
+        up the utilization and temperature columns. check_gpu_nvidia's
+        real output must never regress back to bare unlabeled numbers a
+        weak model can misread."""
+        import ops_monitor
+        with patch.object(
+            ops_monitor, "_run_ps",
+            return_value="NVIDIA RTX A1000, 44, 87, 4732, 8188",
+        ):
+            result = ops_monitor.check_gpu_nvidia({})
+        self.assertIn("temperature 44C", result)
+        self.assertIn("utilization 87%", result)
 
 
 if __name__ == "__main__":
