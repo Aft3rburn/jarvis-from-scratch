@@ -34,6 +34,10 @@ MAX_STEPS = 30
 # 2026-09-08. Caught by this pattern so it can be nudged to retry instead
 # of silently treating the garbled text as a real final answer.
 _FAKE_TOOL_CALL_RE = re.compile(r"<function[=\s]", re.IGNORECASE)
+# Pulls the tool name back out of a malformed call, when there is one, so
+# a follow-up retry can hand the model that tool's real schema instead of
+# a bare "try again."
+_FUNCTION_NAME_RE = re.compile(r"<function[=\s]+([\w\-]+)", re.IGNORECASE)
 
 SYSTEM_PROMPT = (
     "You are a local agent running mostly offline. You have tools to read, "
@@ -180,6 +184,22 @@ def _agentic_turn(
     too, in case the model calls one anyway (e.g. carried over from
     conversation history)."""
     bus.set_state("thinking")
+
+    # Tracks a malformed (plain-text) tool call happening earlier this
+    # turn, so a follow-up plain-text "answer" right after one doesn't get
+    # accepted at face value. Real incident, 2026-09-09 (Local Mary Clone
+    # Session 37): asked to bring up its face, the model garbled the
+    # show_face call three times, then on the fourth try gave up and
+    # fabricated an "interface limitations" excuse instead of retrying or
+    # admitting it didn't know why - a lie, not an honest failure. This
+    # closes that hole in code rather than just asking the model not to,
+    # since the prompt-only version of this rule already existed and it
+    # broke anyway.
+    had_malformed_attempt = False
+    last_malformed_tool = None
+    give_up_retries = 0
+    MAX_GIVE_UP_RETRIES = 2
+
     for step in range(1, MAX_STEPS + 1):
         print(f"\n--- step {step}: asking {MODEL} ---")
         response = call_ollama(messages, allowed_tools)
@@ -189,10 +209,16 @@ def _agentic_turn(
         tool_calls = message.get("tool_calls") or []
         if not tool_calls:
             answer = message.get("content", "")
+
             if _FAKE_TOOL_CALL_RE.search(answer) and step < MAX_STEPS:
+                had_malformed_attempt = True
+                name_match = _FUNCTION_NAME_RE.search(answer)
+                if name_match:
+                    last_malformed_tool = name_match.group(1)
                 print(
                     "\n(model wrote a tool call as plain text instead of "
-                    "the real structured format - nudging it to retry)"
+                    f"the real structured format - raw text: {answer!r} - "
+                    "nudging it to retry)"
                 )
                 messages.append(
                     {
@@ -206,12 +232,90 @@ def _agentic_turn(
                     }
                 )
                 continue
+
+            # The model stopped garbling the call and just answered in
+            # prose instead - but a malformed attempt happened earlier
+            # this same turn, so this is very likely giving up rather
+            # than a real answer. Don't accept it yet; force it to keep
+            # trying, handing it the tool's real schema as a concrete
+            # crutch instead of a bare "try again."
+            if (
+                had_malformed_attempt
+                and give_up_retries < MAX_GIVE_UP_RETRIES
+                and step < MAX_STEPS
+            ):
+                give_up_retries += 1
+                print(
+                    "\n(model gave a plain-text answer instead of retrying "
+                    f"its tool call - raw text: {answer!r} - forcing "
+                    f"another retry, {give_up_retries}/{MAX_GIVE_UP_RETRIES})"
+                )
+                schema_hint = ""
+                if last_malformed_tool:
+                    schema = next(
+                        (s for s in tools.SCHEMAS
+                         if s["function"]["name"] == last_malformed_tool),
+                        None,
+                    )
+                    if schema:
+                        schema_hint = (
+                            f"\n\nHere's the real schema for "
+                            f"{last_malformed_tool}, in case the format "
+                            f"was the problem:\n{json.dumps(schema, indent=2)}"
+                        )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Don't give up, and don't claim the tool call "
+                            "failed for some technical reason - that's not "
+                            "true and you don't actually know why it "
+                            "didn't go through yet. Try the same tool call "
+                            "again, using the real structured tool-calling "
+                            "mechanism, not plain text." + schema_hint
+                        ),
+                    }
+                )
+                continue
+
+            # Retry budget for the give-up pattern is spent and it still
+            # hasn't produced a real tool call. Don't let the model's own
+            # text reach Mark here - whatever it wrote is being discarded
+            # in favor of an answer that's actually true.
+            if had_malformed_attempt and give_up_retries >= MAX_GIVE_UP_RETRIES:
+                print(
+                    "\n(model still couldn't produce a real tool call "
+                    f"after {MAX_GIVE_UP_RETRIES} extra retries - its own "
+                    f"answer is being replaced instead of spoken, it was: "
+                    f"{answer!r})"
+                )
+                answer = (
+                    "I tried to call the tool I needed multiple times and "
+                    "it didn't go through correctly. I don't know why - "
+                    "this needs a person to look at directly."
+                )
+                # Overwrite the stored history too, not just the local
+                # variable - otherwise the fabricated excuse still sits in
+                # `messages` for the model (and any transcript) to see,
+                # even though the honest version is what actually got
+                # spoken. One answer, not two different ones.
+                messages[-1]["content"] = answer
+
             print(f"\n=== answer ===\n{answer}")
             if speak_answer:
                 voice.speak(answer)  # sets its own speaking/idle bus state
             else:
                 bus.set_state("idle")
             return
+
+        # A real structured tool call just came through, so the model has
+        # already proven it can format one correctly this turn - the
+        # give-up gate above exists to catch bailing out INSTEAD of
+        # succeeding, not to second-guess a normal answer that follows a
+        # real tool result. Reset it so a summary answer after a genuine
+        # tool call is never mistaken for the fabrication pattern.
+        had_malformed_attempt = False
+        give_up_retries = 0
 
         for call in tool_calls:
             name = call["function"]["name"]
