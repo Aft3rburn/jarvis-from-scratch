@@ -7,3 +7,10 @@ vault/
 scheduled_tasks/
 relay_config.json
 tone_config.json
+bus/
+# visualizer/ wraps Jared Rhodenizer's ai-visualizer engine (server.py,
+# core.js, index.html, assets/) verbatim - that project is AGPL-3.0 and
+# this repo has no LICENSE of its own, so keeping it local-only avoids
+# a real licensing question rather than quietly ignoring one in a public
+# portfolio repo. bus.py (this project's own small module) stays tracked.
+visualizer/

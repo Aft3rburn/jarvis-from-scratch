@@ -15,6 +15,8 @@ import threading
 import time
 from pathlib import Path
 
+import bus
+
 # faster-whisper's CUDA backend (ctranslate2) needs cuBLAS/cuDNN, which
 # aren't in this machine's system PATH (no full CUDA Toolkit installed,
 # just the driver). The nvidia-cublas-cu12/nvidia-cudnn-cu12 pip packages
@@ -161,6 +163,7 @@ def listen_ptt(key=PTT_KEY) -> str:
     listener = pynput_keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.start()
     pressed.wait()
+    bus.set_state("listening")
 
     def callback(indata, frame_count, time_info, status):
         frames.append(indata.copy())
@@ -180,12 +183,17 @@ def listen_ptt(key=PTT_KEY) -> str:
     listener.join()
 
     if not frames:
+        bus.set_state("idle")
         return ""
     audio = np.concatenate(frames, axis=0).flatten()
     if audio.size < SAMPLE_RATE * 0.2:
+        bus.set_state("idle")
         return ""
     print("transcribing...")
-    return _transcribe(audio)
+    bus.set_state("thinking")
+    text = _transcribe(audio)
+    bus.set_usertext(text)
+    return text
 
 
 def _transcribe(audio: np.ndarray) -> str:
@@ -236,6 +244,25 @@ def strip_for_speech(text: str) -> str:
     return text.strip()
 
 
+def _pump_waveform(audio: np.ndarray, stop: threading.Event) -> None:
+    """Write a downsampled slice of the audio currently under the
+    playhead to the bus every ~150ms, so the face's audio-reactive
+    animation actually tracks what's playing instead of a single stale
+    snapshot (the visualizer treats a waveform older than 0.6s as gone -
+    see WAVEFORM_STALE_S in visualizer/server.py)."""
+    chunk = max(1, int(KOKORO_RATE * 0.15))
+    start = time.time()
+    while not stop.is_set():
+        pos = int((time.time() - start) * KOKORO_RATE)
+        if pos >= audio.size:
+            break
+        piece = audio[pos:pos + chunk]
+        if piece.size:
+            idx = np.linspace(0, piece.size - 1, min(64, piece.size)).astype(int)
+            bus.set_waveform((piece[idx] * 32768.0).tolist())
+        time.sleep(0.15)
+
+
 def speak(text: str) -> None:
     """Clean and synthesize text with Kokoro, then play it back."""
     text = strip_for_speech(text)
@@ -251,5 +278,18 @@ def speak(text: str) -> None:
         return
     audio = np.concatenate(audio_pieces)
 
+    bus.set_state("speaking")
+    bus.set_caption(text)
+    stop_waveform = threading.Event()
+    waveform_thread = threading.Thread(
+        target=_pump_waveform, args=(audio, stop_waveform), daemon=True
+    )
+    waveform_thread.start()
+
     sd.play(audio, samplerate=KOKORO_RATE)
     sd.wait()
+
+    stop_waveform.set()
+    waveform_thread.join(timeout=0.5)
+    bus.set_state("idle")
+    bus.set_caption("")

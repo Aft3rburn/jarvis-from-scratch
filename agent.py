@@ -20,6 +20,7 @@ import threading
 import urllib.error
 import urllib.request
 
+import bus
 import tools
 import voice
 
@@ -178,6 +179,7 @@ def _agentic_turn(
     and any tool call for a name outside the set is rejected at dispatch
     too, in case the model calls one anyway (e.g. carried over from
     conversation history)."""
+    bus.set_state("thinking")
     for step in range(1, MAX_STEPS + 1):
         print(f"\n--- step {step}: asking {MODEL} ---")
         response = call_ollama(messages, allowed_tools)
@@ -206,7 +208,9 @@ def _agentic_turn(
                 continue
             print(f"\n=== answer ===\n{answer}")
             if speak_answer:
-                voice.speak(answer)
+                voice.speak(answer)  # sets its own speaking/idle bus state
+            else:
+                bus.set_state("idle")
             return
 
         for call in tool_calls:
@@ -297,6 +301,7 @@ def run_chat() -> None:
         # tool call this same session) actually takes effect on the
         # very next reply instead of needing a restart.
         messages[0]["content"] = _build_system_prompt()
+        bus.set_usertext(user_input)
         messages.append({"role": "user", "content": user_input})
         try:
             _agentic_turn(messages, speak_answer=True)
