@@ -14,6 +14,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import time
 import uuid
 
 import httpx
@@ -883,6 +884,101 @@ def set_face(args: dict) -> str:
     return f"OK: active face switched {old!r} -> {name!r}. Refresh the face's browser tab to see it."
 
 
+# Window titles your own face pages actually use - "Jarvis Visualizer"
+# for your own hand-built face, "<name> Orbit" for the copied Orbit
+# face (core.js sets document.title to "{name} Orbit" using
+# ai-visualizer.json's own "name" field, which is "Jarvis" here) - a
+# new face you write yourself should keep "Jarvis" somewhere in its
+# <title> so this can still find it. Matched against msedge/chrome
+# specifically (not just any window titled "Jarvis" - your own chat
+# console window is titled that too).
+_FACE_WINDOW_TITLE_RE = "Jarvis|J\\.A\\.R\\.V\\.I\\.S|Orbit|Precision Facade"
+
+
+def _run_ps(script: str) -> str:
+    """Run a fixed PowerShell script - not model-generated text, so this
+    doesn't go through run_shell's safety gate. Used only by show_face's
+    own hardcoded window-management logic below."""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.stdout.strip()
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+
+
+_FIND_FACE_WINDOW_PS = (
+    "Get-Process msedge,chrome -ErrorAction SilentlyContinue | "
+    f"Where-Object {{ $_.MainWindowTitle -match '{_FACE_WINDOW_TITLE_RE}' }} | "
+    "Select-Object -First 1 -ExpandProperty Id"
+)
+
+_FOCUS_WINDOW_PS = """
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class JarvisFaceWin {
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+    [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int ht, bool r);
+    [DllImport("user32.dll")] public static extern int GetSystemMetrics(int n);
+    [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+}
+"@ -ErrorAction SilentlyContinue
+$p = Get-Process -Id __PID__ -ErrorAction SilentlyContinue
+if ($p) {
+    $h = $p.MainWindowHandle
+    $screenW = [JarvisFaceWin]::GetSystemMetrics(0)
+    $screenH = [JarvisFaceWin]::GetSystemMetrics(1)
+    $w = 900; $ht = 900
+    $x = [int](($screenW - $w) / 2); $y = [int](($screenH - $ht) / 2)
+    [JarvisFaceWin]::MoveWindow($h, $x, $y, $w, $ht, $true) | Out-Null
+    # A plain SetForegroundWindow from a background process is blocked by
+    # Windows (proven live 2026-09-09 - the window moved/resized correctly
+    # but stayed behind other windows). Tapping Alt first gives the calling
+    # thread "real recent input," which is what Windows actually checks
+    # before granting the foreground-focus steal.
+    [JarvisFaceWin]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+    [JarvisFaceWin]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 50
+    [JarvisFaceWin]::ShowWindow($h, 9) | Out-Null
+    [JarvisFaceWin]::SetForegroundWindow($h) | Out-Null
+    Write-Output "ok"
+}
+"""
+
+
+def show_face(args: dict | None = None) -> str:
+    """Bring your own face's browser window to the front and center of
+    the screen (roughly 900x900, centered on the primary display). If no
+    browser window is currently showing your face, opens one first at
+    whichever face is currently active, then focuses it."""
+    face_pid = _run_ps(_FIND_FACE_WINDOW_PS)
+    if not face_pid:
+        try:
+            cfg = json.loads(VISUALIZER_CONFIG_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            cfg = {}
+        face = cfg.get("face", "")
+        port = cfg.get("port", 8798)
+        url = f"http://127.0.0.1:{port}/faces/{face}/" if face else f"http://127.0.0.1:{port}/"
+        try:
+            subprocess.Popen(["cmd", "/c", "start", "", "msedge", "--new-window", url])
+        except OSError as e:
+            return f"ERROR: couldn't open a browser for your face: {e}"
+        time.sleep(2)
+        face_pid = _run_ps(_FIND_FACE_WINDOW_PS)
+        if not face_pid:
+            return "Opened a browser window for your face, but couldn't confirm which window it is - check the screen."
+
+    result = _run_ps(_FOCUS_WINDOW_PS.replace("__PID__", face_pid))
+    if result == "ok":
+        return "OK: your face window is now in front, centered on screen."
+    return "Found your face window but couldn't confirm the move/focus succeeded - check the screen."
+
+
 def recent_daily_notes(max_chars: int = 2000) -> str:
     """Return the tail of today's daily note (creating it from the
     template if this is the first run of the day), capped at max_chars.
@@ -917,6 +1013,7 @@ REGISTRY = {
     "set_tone": set_tone,
     "list_faces": list_faces,
     "set_face": set_face,
+    "show_face": show_face,
 }
 
 # Ollama/OpenAI-style function schemas, sent to the model so it knows what's
@@ -1177,6 +1274,14 @@ SCHEMAS = [
                 },
                 "required": ["face"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "show_face",
+            "description": "Bring your own face's browser window to the front and center of the screen. Opens one first if none is currently open.",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {
