@@ -769,14 +769,11 @@ def _tone_bucket(value: float) -> str:
     return "high"
 
 
-def tone_instruction() -> str:
-    """Read tone_config.json (written live by tone_control.py's popup)
-    and return a short natural-language paragraph translating the five
-    sliders into instructions. Not a model-callable tool - read fresh by
-    _build_system_prompt() on every turn, so a slider moved mid-
-    conversation takes effect on the model's very next reply, no
-    restart needed. Falls back to the defaults if the file is missing
-    or malformed - a broken config should never crash a turn."""
+def _load_tone_values() -> dict:
+    """Read tone_config.json (written live by tone_control.py's popup, or
+    by the model itself via set_tone) and return the five current values,
+    falling back to defaults for anything missing or if the file is
+    absent/malformed - a broken config should never crash a turn."""
     values = dict(_TONE_DEFAULTS)
     if TONE_CONFIG_PATH.exists():
         try:
@@ -785,12 +782,55 @@ def tone_instruction() -> str:
                 if k in data:
                     values[k] = data[k]
         except (json.JSONDecodeError, OSError, TypeError):
-            pass  # fall back to defaults rather than break the turn
+            pass
+    return values
 
+
+def tone_instruction() -> str:
+    """Return the current tone sliders (raw numbers, so the model can do
+    its own math for a relative request like 'less silly by 50%') plus a
+    short natural-language paragraph translating them into instructions.
+    Not a model-callable tool itself - read fresh by _build_system_prompt()
+    on every turn, so a slider moved mid-conversation (by the popup or by
+    the model's own set_tone call) takes effect on the very next reply,
+    no restart needed."""
+    values = _load_tone_values()
+    numbers = ", ".join(f"{k}={values[k]}" for k in _TONE_DEFAULTS)
     lines = [
         _TONE_DESCRIPTIONS[k][_tone_bucket(values[k])] for k in _TONE_DEFAULTS
     ]
-    return " ".join(lines)
+    return f"Current sliders (0-10 scale): {numbers}. " + " ".join(lines)
+
+
+def set_tone(args: dict) -> str:
+    """Model-callable: adjust one or more of the five tone sliders. Takes
+    absolute target values (0-10), not deltas - for a relative request
+    like 'less silly by 50%', read the current value from this turn's own
+    system prompt (it's always shown) and compute the target yourself
+    before calling this. Writes straight to tone_config.json, the same
+    file tone_control.py's popup uses, so the popup will show the new
+    position next time it's opened. Clamps out-of-range values rather
+    than rejecting the call outright - a model doing its own arithmetic
+    can overshoot."""
+    values = _load_tone_values()
+    changed = {}
+    for key in _TONE_DEFAULTS:
+        if key in args and args[key] is not None:
+            try:
+                new_val = max(0, min(10, round(float(args[key]))))
+            except (TypeError, ValueError):
+                continue
+            if new_val != values[key]:
+                changed[key] = (values[key], new_val)
+            values[key] = new_val
+    if not changed:
+        return "No sliders changed - either no valid values were given, or they matched what's already set."
+    try:
+        TONE_CONFIG_PATH.write_text(json.dumps(values, indent=2) + "\n", encoding="utf-8")
+    except OSError as e:
+        return f"ERROR writing tone_config.json: {e}"
+    summary = ", ".join(f"{k} {old}->{new}" for k, (old, new) in changed.items())
+    return f"OK: tone updated ({summary}). This takes effect starting with your next reply."
 
 
 def recent_daily_notes(max_chars: int = 2000) -> str:
@@ -824,6 +864,7 @@ REGISTRY = {
     "run_subagent": run_subagent,
     "schedule_task": schedule_task,
     "relay_send": relay_send,
+    "set_tone": set_tone,
 }
 
 # Ollama/OpenAI-style function schemas, sent to the model so it knows what's
@@ -1044,6 +1085,23 @@ SCHEMAS = [
                     "text": {"type": "string", "description": "The message text to send."},
                 },
                 "required": ["to", "text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_tone",
+            "description": "Adjust your own tone sliders (formality, warmth, conciseness, humor, confidence - each 0-10) - the same ones Mark's tone_control.py popup controls. Every reply already shows you the current value of each slider. For a relative request like 'be less silly by 50%', read the current humor value from that line and compute the target yourself (e.g. current 4 -> pass humor=2) - this tool takes the final absolute value, not a delta or percentage. Only pass the sliders that should change. Takes effect starting with your very next reply, no restart.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "formality": {"type": "number", "description": "0 (casual) to 10 (formal). Omit to leave unchanged."},
+                    "warmth": {"type": "number", "description": "0 (detached) to 10 (warm). Omit to leave unchanged."},
+                    "conciseness": {"type": "number", "description": "0 (elaborate) to 10 (concise). Omit to leave unchanged."},
+                    "humor": {"type": "number", "description": "0 (serious) to 10 (playful/sarcastic). Omit to leave unchanged."},
+                    "confidence": {"type": "number", "description": "0 (suggestive) to 10 (authoritative/decisive). Omit to leave unchanged."},
+                },
             },
         },
     },
