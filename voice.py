@@ -150,10 +150,17 @@ def listen_ptt(key=PTT_KEY) -> str:
     pressed = threading.Event()
     released = threading.Event()
     frames = []
+    
+    # Track whether we've already processed a press to prevent duplicate triggers
+    press_processed = False
 
     def on_press(k):
+        nonlocal press_processed
         if k == key:
-            pressed.set()
+            # Only process the first press
+            if not press_processed:
+                pressed.set()
+                press_processed = True
 
     def on_release(k):
         if k == key:

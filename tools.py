@@ -24,6 +24,28 @@ import httpx
 # resolved relative to here unless already absolute.
 WORKSPACE = pathlib.Path(__file__).parent.resolve()
 
+# Code-level gate on write_file/edit_file for source files, added
+# 2026-09-09 after a real incident (a NameError crash in voice.py) needed
+# Mary, not Jarvis, to root-cause and fix - Mark asked to give Jarvis that
+# same troubleshooting ability. Matches the run_shell soft-block pattern
+# already proven necessary on this model: a prompt-only "confirm before
+# editing code" rule doesn't reliably hold, so the friction has to live in
+# code. Scoped to .py for now (the concrete case that prompted this); widen
+# this set if another source-file type needs the same protection later.
+_SOURCE_CODE_SUFFIXES = {".py"}
+
+
+def _source_edit_block_message(path: pathlib.Path, tool_name: str) -> str:
+    return (
+        f"BLOCKED: {path} is source code (.py). Writing to it is never "
+        "allowed on the first call - same rule as run_shell's "
+        "disruptive-action gate, see the 2026-09-09 troubleshooting-gate "
+        "entry in INDEX.md. Answer directly now (no more tool calls this "
+        "turn) stating the exact change and what it does, then wait for "
+        f"Mark to actually reply yes. Only if he does, call {tool_name} "
+        "again with the same arguments plus confirmed=true - not before."
+    )
+
 # The vault: a lightweight version of Mary's own memory pattern (an
 # always-loaded index + dated daily notes) instead of one flat file.
 # Scaled down on purpose - no folder-per-domain taxonomy, no wikilinks,
@@ -188,6 +210,9 @@ def read_file(args: dict) -> str:
 def write_file(args: dict) -> str:
     path = _resolve(args["path"])
     content = args.get("content", "")
+    confirmed = bool(args.get("confirmed", False))
+    if path.suffix in _SOURCE_CODE_SUFFIXES and not confirmed:
+        return _source_edit_block_message(path, "write_file")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
@@ -524,6 +549,10 @@ def edit_file(args: dict) -> str:
     old = args["old_string"]
     new = args["new_string"]
     replace_all = bool(args.get("replace_all", False))
+    confirmed = bool(args.get("confirmed", False))
+
+    if path.suffix in _SOURCE_CODE_SUFFIXES and not confirmed:
+        return _source_edit_block_message(path, "edit_file")
 
     try:
         content = path.read_text(encoding="utf-8")
@@ -838,6 +867,68 @@ def set_tone(args: dict) -> str:
 # engine - see Local Mary Clone Session 32) ---
 VISUALIZER_DIR = WORKSPACE / "visualizer"
 VISUALIZER_CONFIG_PATH = VISUALIZER_DIR / "ai-visualizer.json"
+VISUALIZER_RUN_BAT = VISUALIZER_DIR / "run.bat"
+
+
+def _visualizer_port() -> int:
+    try:
+        cfg = json.loads(VISUALIZER_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        cfg = {}
+    return int(cfg.get("port", 8790))
+
+
+def _kill_visualizer_processes(port: int, max_rounds: int = 5) -> int:
+    """Kill whatever's actually listening on the visualizer's port, in a
+    loop rather than once. Windows lets more than one process bind the
+    same port without erroring (confirmed live 2026-09-09: three
+    separate server.py instances were all bound to 8798 at once), so a
+    single query-and-kill can miss zombies that only surface as "the"
+    owner once the one ahead of them is gone. Returns how many were
+    actually killed."""
+    killed = 0
+    find_ps = (
+        f"Get-NetTCPConnection -LocalPort {port} -State Listen "
+        "-ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess"
+    )
+    for _ in range(max_rounds):
+        pids = [p.strip() for p in _run_ps(find_ps).splitlines() if p.strip()]
+        if not pids:
+            break
+        for pid in set(pids):
+            _run_ps(f"Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue")
+            killed += 1
+        time.sleep(0.4)
+    return killed
+
+
+def _launch_visualizer_server() -> None:
+    """Start exactly one fresh instance via run.bat (same interpreter-
+    selection logic it already has), detached so it outlives this call
+    and keeps its own console hidden."""
+    subprocess.Popen(
+        ["cmd", "/c", "start", "/min", "", str(VISUALIZER_RUN_BAT)],
+        cwd=str(VISUALIZER_DIR),
+    )
+
+
+def _wait_for_face(port: int, name: str, timeout_s: float = 8.0) -> str | None:
+    """Poll /config until the fresh server reports the face we just set,
+    or give up. Returns the face /config actually reports (possibly
+    still the old one, if we timed out), or None if /config never
+    answered at all."""
+    deadline = time.time() + timeout_s
+    last_face = None
+    while time.time() < deadline:
+        try:
+            resp = httpx.get(f"http://127.0.0.1:{port}/config", timeout=1.0)
+            last_face = resp.json().get("face")
+            if last_face == name:
+                return last_face
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return last_face
 
 
 def list_faces(args: dict | None = None) -> str:
@@ -862,9 +953,18 @@ def list_faces(args: dict | None = None) -> str:
 def set_face(args: dict) -> str:
     """Switch your active visual face to one already present in
     visualizer/faces/ (call list_faces first if you don't know what's
-    there). Edits visualizer/ai-visualizer.json's 'face' field - takes
-    effect the next time the face page is opened/refreshed in a
-    browser, no restart of you needed."""
+    there). server.py reads ai-visualizer.json once into memory at
+    startup and never re-reads it, so just editing the file does
+    nothing on its own (learned the hard way 2026-09-09 - see
+    LESSONS.md) - this function handles that itself: writes the new
+    face, kills whatever's actually running the visualizer (looping
+    since Windows can let more than one process end up bound to the
+    same port without erroring), starts exactly one fresh instance, and
+    polls /config to confirm the new face is really live before
+    reporting success. If verification times out, says so honestly
+    instead of claiming it worked - no restart needed on your end
+    either way, but don't assume "no restart needed" means "definitely
+    worked" without reading the return value."""
     name = str(args.get("face", "")).strip()
     if not name:
         return "ERROR: no face name given."
@@ -877,11 +977,24 @@ def set_face(args: dict) -> str:
         cfg = {}
     old = cfg.get("face", "")
     cfg["face"] = name
+    port = int(cfg.get("port", 8790))
     try:
         VISUALIZER_CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
     except OSError as e:
         return f"ERROR writing ai-visualizer.json: {e}"
-    return f"OK: active face switched {old!r} -> {name!r}. Refresh the face's browser tab to see it."
+
+    killed = _kill_visualizer_processes(port)
+    _launch_visualizer_server()
+    live_face = _wait_for_face(port, name)
+
+    if live_face == name:
+        return (f"OK: active face switched {old!r} -> {name!r}, server restarted "
+                f"({killed} old process(es) cleared), confirmed live via /config.")
+    if live_face is None:
+        return (f"WROTE {name!r} to ai-visualizer.json and restarted the server, but /config "
+                f"never answered within the timeout - check manually, don't assume it worked.")
+    return (f"WROTE {name!r} to ai-visualizer.json and restarted the server, but /config still "
+            f"reports {live_face!r} - the restart didn't pick up the change, check manually.")
 
 
 # Window titles your own face pages actually use - "Jarvis Visualizer"
@@ -1037,12 +1150,16 @@ SCHEMAS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Write (overwrite) a text file in the agent's workspace, creating parent folders as needed.",
+            "description": "Write (overwrite) a text file in the agent's workspace, creating parent folders as needed. Writing a .py file is blocked on the first call - state the exact change to Mark and wait for a yes, then retry with confirmed=true.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path, relative to the workspace unless absolute."},
                     "content": {"type": "string", "description": "Full text content to write."},
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": "Set true only on a retry, only after Mark has explicitly replied yes to a source-code change you already stated to him. Never set true on a first attempt. Only relevant for .py files - ignored otherwise.",
+                    },
                 },
                 "required": ["path", "content"],
             },
@@ -1181,7 +1298,7 @@ SCHEMAS = [
         "type": "function",
         "function": {
             "name": "edit_file",
-            "description": "Replace an exact substring in a file with new text. Fails if old_string isn't found or isn't unique (unless replace_all is set) - safer than write_file for a small change to an existing file.",
+            "description": "Replace an exact substring in a file with new text. Fails if old_string isn't found or isn't unique (unless replace_all is set) - safer than write_file for a small change to an existing file. Editing a .py file is blocked on the first call - state the exact change to Mark and wait for a yes, then retry with confirmed=true.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1189,6 +1306,10 @@ SCHEMAS = [
                     "old_string": {"type": "string", "description": "Exact text to find and replace."},
                     "new_string": {"type": "string", "description": "Text to replace it with."},
                     "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring old_string to be unique. Defaults to false."},
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": "Set true only on a retry, only after Mark has explicitly replied yes to a source-code change you already stated to him. Never set true on a first attempt. Only relevant for .py files - ignored otherwise.",
+                    },
                 },
                 "required": ["path", "old_string", "new_string"],
             },
@@ -1266,7 +1387,7 @@ SCHEMAS = [
         "type": "function",
         "function": {
             "name": "set_face",
-            "description": "Switch your active visual face to one already in visualizer/faces/ (call list_faces first to see real options). Takes effect the next time the face's browser tab is refreshed.",
+            "description": "Switch your active visual face to one already in visualizer/faces/ (call list_faces first to see real options). Handles the full switch itself - writes the config, restarts the visualizer server, and confirms the new face is actually live via /config - so no separate restart step is needed. Read the return value: it says plainly if verification timed out or failed rather than assuming success.",
             "parameters": {
                 "type": "object",
                 "properties": {
