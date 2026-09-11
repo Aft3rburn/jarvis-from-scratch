@@ -154,6 +154,55 @@ def _write_guard(existing_text: str, new_text: str, parse_ts) -> str:
     return ""
 
 
+# --- Self-incapacity claim guard for append_daily_note and append_lesson ---
+#
+# Root cause this exists for (2026-09-10): a self-diagnosed "I can't do X"
+# claim about the agent's own tool-calling ability got logged straight to
+# LESSONS.md via a normal, successful append_lesson call - no malformed
+# tool call happened first, so the existing give-up retry gate in
+# agent.py (which only watches the spoken final answer) never saw it.
+# The claim was false - tool calls work fine, append_lesson itself proves
+# it - but because LESSONS.md's tail auto-loads into every later run, it
+# sat there being treated as fact until Mary caught and corrected it.
+# Same root problem as the 2026-09-08 fabricated-facts-about-Mark
+# incident, just landing through a different tool. Fix: a claim shaped
+# like "tool calls / the interface can't do X" requires verified=true -
+# proof the caller actually read the relevant code or a real traceback
+# first (see INDEX.md's "Debugging a crash" playbook), not just a
+# plausible-sounding guess.
+
+_SELF_INCAPACITY_RE = re.compile(
+    r"(tool[\s\-]?calls?|tool[\s\-]?execution|function[\s\-]?calls?|"
+    r"the interface|this interface)"
+    r"(?:(?!\.\s|\n).){0,150}?"
+    r"(can'?t|cannot|unable|persistent failure|limitation|doesn'?t work|"
+    r"not (?:something|possible))",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _capability_claim_guard(text: str, verified: bool) -> str:
+    """Returns a BLOCKED message if `text` claims the agent itself (its
+    tool-calling, its interface) can't do something, and that claim
+    hasn't been marked verified. '' if fine to proceed."""
+    if verified:
+        return ""
+    if _SELF_INCAPACITY_RE.search(text):
+        return (
+            "BLOCKED: this reads as a claim that tool calls or the "
+            "interface itself is broken/limited - that exact kind of "
+            "claim has been fabricated before (2026-09-10) and turned "
+            "out false; tool calls work. Before logging this, actually "
+            "read the relevant code or a real traceback (see INDEX.md's "
+            "'Debugging a crash' playbook) - if you've genuinely done "
+            "that and it's grounded in real evidence, call this again "
+            "with verified=true. If you haven't verified it, don't log "
+            "it as a lesson at all - just say plainly you don't know "
+            "why something didn't work."
+        )
+    return ""
+
+
 def _parse_daily_header_ts(header: str) -> object:
     m = re.fullmatch(r"(\d{2}):(\d{2})", header.strip())
     if not m:
@@ -335,6 +384,9 @@ def append_daily_note(args: dict) -> str:
     blocked = _write_guard(existing, text, _parse_daily_header_ts)
     if blocked:
         return blocked
+    blocked = _capability_claim_guard(text, bool(args.get("verified", False)))
+    if blocked:
+        return blocked
     timestamp = datetime.datetime.now().strftime("%H:%M")
     try:
         with path.open("a", encoding="utf-8") as f:
@@ -364,6 +416,9 @@ def append_lesson(args: dict) -> str:
     path = _ensure_lessons_file()
     existing = path.read_text(encoding="utf-8")
     blocked = _write_guard(existing, lesson, _parse_lesson_header_ts)
+    if blocked:
+        return blocked
+    blocked = _capability_claim_guard(lesson, bool(args.get("verified", False)))
     if blocked:
         return blocked
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -1220,6 +1275,10 @@ SCHEMAS = [
                 "type": "object",
                 "properties": {
                     "text": {"type": "string", "description": "Text to append."},
+                    "verified": {
+                        "type": "boolean",
+                        "description": "Only set true if this text claims tool calls, the interface, or your own capabilities are broken/limited AND you've actually confirmed that by reading the real code or a real traceback - not a guess. Omit or leave false otherwise; a claim like that without verified=true will be blocked.",
+                    },
                 },
                 "required": ["text"],
             },
@@ -1235,6 +1294,10 @@ SCHEMAS = [
                 "properties": {
                     "lesson": {"type": "string", "description": "The lesson itself: what worked, what didn't, and why."},
                     "topic": {"type": "string", "description": "Optional short topic label, e.g. 'scheduling' or 'ollama'."},
+                    "verified": {
+                        "type": "boolean",
+                        "description": "Only set true if this lesson claims tool calls, the interface, or your own capabilities are broken/limited AND you've actually confirmed that by reading the real code or a real traceback - not a guess. Omit or leave false otherwise; a claim like that without verified=true will be blocked.",
+                    },
                 },
                 "required": ["lesson"],
             },

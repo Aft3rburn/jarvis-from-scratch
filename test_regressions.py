@@ -169,6 +169,66 @@ class TestMemorySelfPoisoningGuard(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Regression 2b: self-incapacity claims sneaking into permanent memory
+# through a normal, successful tool call (2026-09-10). A model turn logged
+# "persistent failure to execute tool calls due to interface formatting
+# limitations" straight into LESSONS.md via a completely ordinary
+# append_lesson call - no malformed tool call happened first, so the
+# give-up gate below (which only watches the spoken answer) never saw it.
+# The claim was false. Fix: append_lesson/append_daily_note now reject a
+# claim shaped like "tool calls / the interface can't do X" unless the
+# call also passes verified=true.
+# ---------------------------------------------------------------------------
+class TestCapabilityClaimGuard(unittest.TestCase):
+    REAL_FABRICATION = (
+        "Encountered persistent failure to execute any tool calls due to "
+        "interface formatting limitations. This is a limitation in how "
+        "the interface handles tool execution rather than an issue with "
+        "the tools themselves."
+    )
+
+    def test_blocks_unverified_self_incapacity_claim(self):
+        result = tools._capability_claim_guard(self.REAL_FABRICATION, False)
+        self.assertTrue(
+            result.startswith("BLOCKED"),
+            "the exact real 2026-09-10 fabrication text must be blocked "
+            "when unverified - got: " + repr(result),
+        )
+
+    def test_allows_same_claim_when_verified(self):
+        result = tools._capability_claim_guard(self.REAL_FABRICATION, True)
+        self.assertEqual(
+            result, "",
+            "verified=true must let a capability claim through - the gate "
+            "requires evidence, not a permanent ban on the topic. Got: "
+            + repr(result),
+        )
+
+    def test_allows_unrelated_technical_lesson(self):
+        # Real, legitimate lesson from this same file - not about the
+        # agent's own tool-calling ability, must never be caught.
+        text = (
+            "rocm-smi doesn't exist on Windows at all - rewrote "
+            "check_gpu_amd around Windows perf counters instead."
+        )
+        result = tools._capability_claim_guard(text, False)
+        self.assertEqual(
+            result, "",
+            "a real hardware/tooling lesson unrelated to the agent's own "
+            "tool-calling must not be blocked - got: " + repr(result),
+        )
+
+    def test_append_lesson_rejects_unverified_claim_end_to_end(self):
+        with patch.object(tools, "_ensure_lessons_file") as mock_ensure, \
+             patch("pathlib.Path.read_text", return_value="# Lessons Learned\n"), \
+             patch("pathlib.Path.open") as mock_open:
+            mock_ensure.return_value = tools.LESSONS_FILE
+            result = tools.append_lesson({"lesson": self.REAL_FABRICATION})
+        self.assertTrue(result.startswith("BLOCKED"))
+        mock_open.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Regression 3: the fabrication give-up gate (Local Mary Clone Session 37,
 # 2026-09-09). Root cause: asked to bring up its face, the model garbled
 # show_face's tool call three times, then gave up and invented an
