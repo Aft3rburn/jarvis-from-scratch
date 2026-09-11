@@ -171,12 +171,25 @@ def _write_guard(existing_text: str, new_text: str, parse_ts) -> str:
 # first (see INDEX.md's "Debugging a crash" playbook), not just a
 # plausible-sounding guess.
 
-_SELF_INCAPACITY_RE = re.compile(
-    r"(tool[\s\-]?calls?|tool[\s\-]?execution|function[\s\-]?calls?|"
+_CAPABILITY_PHRASE = (
+    r"(?:tool[\s\-]?calls?|tool[\s\-]?execution|function[\s\-]?calls?|"
     r"the interface|this interface)"
-    r"(?:(?!\.\s|\n).){0,150}?"
-    r"(can'?t|cannot|unable|persistent failure|limitation|doesn'?t work|"
-    r"not (?:something|possible))",
+)
+_NEGATION_PHRASE = (
+    r"(?:can'?t|cannot|unable|persistent failure|limitation|doesn'?t work|"
+    r"not (?:something|possible))"
+)
+_GAP = r"(?:(?!\.\s|\n).){0,150}?"
+
+# Matches either word order - "tool calls ... can't" (the original
+# shape) or "unable ... tool calls" (found live 2026-09-11: a false
+# "unable to execute tool calls" lesson got past the original
+# capability-first-only pattern, poisoned LESSONS.md, and triggered a
+# real fabrication spiral on the very next turn - the negation word
+# coming first was never covered before).
+_SELF_INCAPACITY_RE = re.compile(
+    rf"(?:{_CAPABILITY_PHRASE}{_GAP}{_NEGATION_PHRASE}"
+    rf"|{_NEGATION_PHRASE}{_GAP}{_CAPABILITY_PHRASE})",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -1154,6 +1167,16 @@ def show_face(args: dict | None = None) -> str:
             cfg = {}
         face = cfg.get("face", "")
         port = cfg.get("port", 8798)
+        # The visualizer server only comes up when set_face() runs it or
+        # via the desktop launcher - nothing keeps it alive across a
+        # reboot. Don't open a browser at a dead URL if it's not
+        # actually answering (found live 2026-09-11 - this was the real
+        # bug behind "can't bring up his face").
+        try:
+            httpx.get(f"http://127.0.0.1:{port}/config", timeout=1.0)
+        except Exception:
+            _launch_visualizer_server()
+            _wait_for_face(port, face)
         url = f"http://127.0.0.1:{port}/faces/{face}/" if face else f"http://127.0.0.1:{port}/"
         try:
             subprocess.Popen(["cmd", "/c", "start", "", "msedge", "--new-window", url])

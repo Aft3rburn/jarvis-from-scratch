@@ -227,6 +227,35 @@ class TestCapabilityClaimGuard(unittest.TestCase):
         self.assertTrue(result.startswith("BLOCKED"))
         mock_open.assert_not_called()
 
+    # Real 2026-09-11 incident: a false "Unable to execute tool calls..."
+    # lesson got past the guard above (negation word BEFORE the capability
+    # phrase, the original regex only matched the other order), poisoned
+    # LESSONS.md, and triggered a real fabrication spiral on Mark's very
+    # next message. Fixed by matching both word orders - this is the exact
+    # text that slipped through before the fix.
+    REAL_FABRICATION_NEGATION_FIRST = (
+        "Unable to execute tool calls for show_face and list_faces due to "
+        "a persistent formatting issue in the agent's response parsing. "
+        "The tool calls are properly formatted but fail during execution."
+    )
+
+    def test_blocks_negation_first_phrasing(self):
+        result = tools._capability_claim_guard(
+            self.REAL_FABRICATION_NEGATION_FIRST, False
+        )
+        self.assertTrue(
+            result.startswith("BLOCKED"),
+            "the exact real 2026-09-11 fabrication text (negation word "
+            "before the capability phrase) must be blocked when unverified "
+            "- got: " + repr(result),
+        )
+
+    def test_allows_negation_first_phrasing_when_verified(self):
+        result = tools._capability_claim_guard(
+            self.REAL_FABRICATION_NEGATION_FIRST, True
+        )
+        self.assertEqual(result, "")
+
 
 # ---------------------------------------------------------------------------
 # Regression 3: the fabrication give-up gate (Local Mary Clone Session 37,
