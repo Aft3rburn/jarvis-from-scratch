@@ -377,6 +377,136 @@ class TestFabricationGiveUpGate(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Regression 3b: the "explaining the format" false-positive spiral
+# (2026-09-12). Mark asked "what is the correct way to format a tool
+# call?" - a meta-question, not a request to do anything. The model
+# answered correctly in prose, illustrating the shape with a generic
+# placeholder ("<function=tool_name>..."). _FAKE_TOOL_CALL_RE fired on
+# that placeholder anyway, telling the model its correct answer "wasn't a
+# valid tool call" and demanding a retry it had no reason to make. It had
+# nothing real to retry, so it spiraled for 30 steps inventing fake calls
+# to real tools trying to satisfy a demand that made no sense, then gave
+# up with a fabricated "I can't execute tool calls" excuse - and because
+# every single step re-triggered the fake-call regex, give_up_retries
+# never advanced past 0, so the existing give-up-overwrite gate never
+# fired either (see TestUniversalCapabilityNet below for that half).
+# Fix: only treat "<function=...>" as a real malformed attempt when the
+# extracted name resolves to an actual registered tool - a placeholder
+# like "tool_name" never does, because an explanation invents a name
+# while a real attempt uses one that exists.
+# ---------------------------------------------------------------------------
+class TestExplanatoryAnswerNotNudged(unittest.TestCase):
+    def test_placeholder_function_example_passes_through(self):
+        """The exact 2026-09-12 shape: a correct, prose explanation of
+        tool-call format using a placeholder name must be accepted as the
+        final answer, not mistaken for a real malformed attempt."""
+        explanation = (
+            "The correct way to format a tool call is with an XML block "
+            "that starts with <function=, followed by the tool name, and "
+            "then its parameters within <parameter=> tags. It should "
+            "look like this:\n\n<function=tool_name>\n"
+            "<parameter=parameter_1>\nvalue_1\n</parameter>\n</function>\n\n"
+            "Each parameter must be on its own line."
+        )
+        scripted = _ScriptedOllama([_plain_text_message(explanation)])
+        messages = [
+            {"role": "user", "content": "what is the correct way to format a tool call?"}
+        ]
+        with patch.object(agent, "call_ollama", scripted):
+            agent._agentic_turn(messages, speak_answer=False)
+
+        self.assertEqual(
+            messages[-1]["content"], explanation,
+            "an explanatory answer using a placeholder tool name must "
+            "pass through untouched, not get nudged into a retry spiral "
+            "it has no real tool call to retry - got: "
+            + repr(messages[-1]["content"]),
+        )
+        self.assertEqual(
+            scripted.calls, 1,
+            "should answer in a single step - no retry was ever warranted",
+        )
+
+    def test_placeholder_name_not_confused_with_real_tool(self):
+        """A real malformed attempt (genuine tool name) still gets nudged
+        - this fix narrows the trigger, it doesn't disable it."""
+        scripted = _ScriptedOllama([
+            _malformed_text_message("show_face"),
+            _real_tool_call_message("show_face"),
+            _plain_text_message("Your face is up now."),
+        ])
+        messages = [{"role": "user", "content": "bring up your face"}]
+        with patch.object(agent, "call_ollama", scripted), \
+             patch.dict(tools.REGISTRY, {"show_face": lambda args: "OK: face shown"}):
+            agent._agentic_turn(messages, speak_answer=False)
+
+        self.assertEqual(messages[-1]["content"], "Your face is up now.")
+        self.assertEqual(
+            scripted.calls, 3,
+            "a genuine malformed attempt (real tool name) must still be "
+            "nudged to retry, not waved through like an explanation",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Regression 3c: the universal capability-claim net (2026-09-12), the other
+# half of the same incident. Once the model spiraled (see above), every one
+# of its 30 steps re-emitted fake-call syntax naming a real tool, so
+# had_malformed_attempt stayed true but give_up_retries never left 0 - the
+# specific state that has to exist for the give-up-overwrite check to fire.
+# The loop hit MAX_STEPS still holding a fabricated "I can't execute tool
+# calls" answer and spoke it verbatim, unfiltered. Fix: right before any
+# final answer is printed/spoken, run it through the same
+# tools._capability_claim_guard already trusted for append_lesson/
+# append_daily_note - independent of whatever state the retry machinery
+# above is in.
+# ---------------------------------------------------------------------------
+class TestUniversalCapabilityNet(unittest.TestCase):
+    def test_maxsteps_exhausted_with_fabricated_claim_gets_overwritten(self):
+        """Every step re-triggers the malformed-attempt path (so
+        give_up_retries never advances) all the way to MAX_STEPS, and the
+        very last step's content is a fabricated capability claim. Must
+        still be replaced with the honest fallback, not spoken as-is."""
+        fabrication = (
+            "Cannot execute tool calls despite understanding the correct "
+            "format. System interprets all attempts as plain text rather "
+            "than actual executions."
+        )
+        scripted = _ScriptedOllama(
+            [_malformed_text_message("run_shell") for _ in range(agent.MAX_STEPS - 1)]
+            + [_plain_text_message(fabrication)]
+        )
+        messages = [{"role": "user", "content": "what is the correct way to format a tool call?"}]
+        with patch.object(agent, "call_ollama", scripted):
+            agent._agentic_turn(messages, speak_answer=False)
+
+        final = messages[-1]["content"]
+        self.assertNotIn(
+            "Cannot execute tool calls", final,
+            "the fabricated claim must never survive as the final answer, "
+            "even when it arrives on the very last step of the loop's "
+            "step budget - got: " + repr(final),
+        )
+        self.assertIn("don't know why", final.lower())
+
+    def test_honest_final_answer_at_maxsteps_untouched(self):
+        """Same shape (fake-call spam all the way to MAX_STEPS) but the
+        final content is an honest, non-fabricating answer - must pass
+        through as-is, the net shouldn't rewrite everything."""
+        scripted = _ScriptedOllama(
+            [_malformed_text_message("run_shell") for _ in range(agent.MAX_STEPS - 1)]
+            + [_plain_text_message("Here's the disk usage you asked for.")]
+        )
+        messages = [{"role": "user", "content": "check disk space"}]
+        with patch.object(agent, "call_ollama", scripted):
+            agent._agentic_turn(messages, speak_answer=False)
+
+        self.assertEqual(
+            messages[-1]["content"], "Here's the disk usage you asked for."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Regression 4: the startup-sitrep tool-call spiral (Local Mary Clone
 # Session 23, 2026-09-09). Root cause: with every tool still on the table,
 # the sitrep turn spiraled through 15+ tool calls (re-searching the vault,

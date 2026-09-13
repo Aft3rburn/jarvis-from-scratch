@@ -257,11 +257,32 @@ def _agentic_turn(
         if not tool_calls:
             answer = message.get("content", "")
 
-            if _FAKE_TOOL_CALL_RE.search(answer) and step < MAX_STEPS:
+            name_match = _FUNCTION_NAME_RE.search(answer)
+            # Real incident, 2026-09-12: Mark asked "what is the correct
+            # way to format a tool call?" - a meta-question, not a request
+            # to do anything. The model correctly answered in prose using
+            # a generic placeholder example ("<function=tool_name>") to
+            # illustrate the shape, and this regex fired on it anyway,
+            # telling the model its own correct answer "wasn't a valid
+            # tool call" and demanding it "try again properly." The model
+            # had never attempted a real tool call in the first place, so
+            # it had nothing to retry - it spiraled through 30 steps
+            # inventing fake calls to real tools (run_shell, check_disk,
+            # list_faces...) trying to satisfy a demand that made no
+            # sense, then gave up with a fabricated "I can't execute tool
+            # calls" excuse. A genuine malformed attempt always names a
+            # REAL tool, because the model is actually trying to do
+            # something with it; an explanation uses a placeholder name
+            # like "tool_name" that isn't in the registry. Only treat this
+            # as a real attempt worth nudging when the name resolves.
+            is_real_attempt = (
+                _FAKE_TOOL_CALL_RE.search(answer)
+                and name_match is not None
+                and name_match.group(1) in tools.REGISTRY
+            )
+            if is_real_attempt and step < MAX_STEPS:
                 had_malformed_attempt = True
-                name_match = _FUNCTION_NAME_RE.search(answer)
-                if name_match:
-                    last_malformed_tool = name_match.group(1)
+                last_malformed_tool = name_match.group(1)
                 print(
                     "\n(model wrote a tool call as plain text instead of "
                     f"the real structured format - raw text: {answer!r} - "
@@ -346,6 +367,29 @@ def _agentic_turn(
                 # `messages` for the model (and any transcript) to see,
                 # even though the honest version is what actually got
                 # spoken. One answer, not two different ones.
+                messages[-1]["content"] = answer
+
+            # Last-resort net, independent of the state machine above: no
+            # matter which path got here, a final answer that fabricates
+            # "tool calls / the interface can't do X" never reaches Mark's
+            # ears. Real incident, 2026-09-12: the model spiraled through
+            # every retry emitting fake-call syntax instead of a clean
+            # give-up (see is_real_attempt above), so give_up_retries never
+            # advanced past 0 and the check above never fired - this exact
+            # fabricated claim reached voice.speak() unfiltered. Reuses the
+            # same guard already trusted for append_lesson/append_daily_note
+            # (tools._capability_claim_guard) instead of a second, looser
+            # pattern.
+            if tools._capability_claim_guard(answer, verified=False):
+                print(
+                    "\n(final answer fabricates a self-incapacity claim - "
+                    f"replacing it instead of speaking it, it was: {answer!r})"
+                )
+                answer = (
+                    "I tried to call the tool I needed multiple times and "
+                    "it didn't go through correctly. I don't know why - "
+                    "this needs a person to look at directly."
+                )
                 messages[-1]["content"] = answer
 
             print(f"\n=== answer ===\n{answer}")
