@@ -26,7 +26,7 @@ import tools
 import voice
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL = "qwen3-coder:30b"
+MODEL = "granite4:tiny-h"
 MAX_STEPS = 30
 
 # Fast lane, item 3 of the 2026-09-10 four-part roadmap. A second Ollama
@@ -207,6 +207,7 @@ def call_ollama(
         "messages": messages,
         "tools": schemas,
         "stream": False,
+        "think": False,
     }
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
