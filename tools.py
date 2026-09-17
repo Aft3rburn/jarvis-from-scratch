@@ -273,12 +273,36 @@ def read_file(args: dict) -> str:
         return f"ERROR reading {path}: {e}"
 
 
+def _python_syntax_error(content: str, path: pathlib.Path) -> str | None:
+    """Returns a human-readable syntax error if `content` isn't valid
+    Python, None if it compiles clean. Real incident, 2026-09-17: the
+    model wrote a syntactically broken function straight over the real
+    tools.py (a stray colon inside an `if`) and then claimed it
+    'installed successfully' without ever running it. This makes that
+    exact failure structurally impossible for .py writes - broken code
+    never reaches disk in the first place, so there's nothing left to
+    falsely claim success about."""
+    try:
+        compile(content, str(path), "exec")
+    except SyntaxError as e:
+        return f"line {e.lineno}: {e.msg}"
+    return None
+
+
 def write_file(args: dict) -> str:
     path = _resolve(args["path"])
     content = args.get("content", "")
     confirmed = bool(args.get("confirmed", False))
     if path.suffix in _SOURCE_CODE_SUFFIXES and not confirmed:
         return _source_edit_block_message(path, "write_file")
+    if path.suffix in _SOURCE_CODE_SUFFIXES:
+        err = _python_syntax_error(content, path)
+        if err:
+            return (
+                f"ERROR: not writing {path} - the content doesn't parse "
+                f"as valid Python ({err}). Nothing was written. Fix the "
+                "syntax before trying again."
+            )
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
@@ -605,6 +629,22 @@ def glob_files(args: dict) -> str:
 _SEARCH_SKIP_DIRS = {".venv", "__pycache__", ".git"}
 
 
+def _is_binary(path: pathlib.Path) -> bool:
+    """True if `path` looks like binary content rather than text - the
+    same NUL-byte heuristic grep -I/git use. Real incident, 2026-09-17: a
+    search for 'MCP' matched raw bytes inside a compiled .pyd, and that
+    garbage got handed to the model as if it were readable file content -
+    it then confidently hallucinated a whole fabricated analysis of it.
+    Skipping binary files here means search_files can never hand the
+    model text that was never text to begin with."""
+    try:
+        with path.open("rb") as f:
+            chunk = f.read(8192)
+    except Exception:
+        return False
+    return b"\x00" in chunk
+
+
 def search_files(args: dict) -> str:
     query = args["query"]
     glob_pattern = args.get("glob", "**/*")
@@ -615,6 +655,8 @@ def search_files(args: dict) -> str:
     LIMIT = 200
     for path in sorted(WORKSPACE.glob(glob_pattern)):
         if not path.is_file() or _SEARCH_SKIP_DIRS & set(path.parts):
+            continue
+        if _is_binary(path):
             continue
         try:
             lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -665,6 +707,14 @@ def edit_file(args: dict) -> str:
         )
 
     new_content = content.replace(old, new) if replace_all else content.replace(old, new, 1)
+    if path.suffix in _SOURCE_CODE_SUFFIXES:
+        err = _python_syntax_error(new_content, path)
+        if err:
+            return (
+                f"ERROR: not writing {path} - the result doesn't parse "
+                f"as valid Python ({err}). Nothing was written. Fix the "
+                "replacement text before trying again."
+            )
     try:
         path.write_text(new_content, encoding="utf-8")
     except Exception as e:

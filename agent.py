@@ -508,25 +508,61 @@ def _agentic_turn(
 
             messages.append({"role": "tool", "content": result, "name": name})
 
+            # A BLOCKED result means a disruptive-action gate just fired
+            # (write_file/edit_file's source-code gate, run_shell's
+            # soft-block, restart_hung_process). The gate's whole point is
+            # a real turn boundary between "state it" and a confirmed=true
+            # retry - real incident, 2026-09-17: the model set
+            # confirmed=true on its very first call, no block, no wait,
+            # because nothing actually stopped it from just deciding to
+            # retry inside the same turn. Ending the turn here - instead
+            # of feeding the block back and letting the model choose its
+            # next move - forces a retry to wait for an actual new message
+            # from Mark instead of trusting the model's own restraint.
+            if isinstance(result, str) and result.startswith("BLOCKED:"):
+                print(
+                    "\n(tool call blocked by a disruptive-action gate - "
+                    "ending this turn so a retry needs a real reply from "
+                    "Mark, not the same turn)"
+                )
+                if speak_answer:
+                    voice.speak(result)
+                else:
+                    bus.set_state("idle")
+                return {"tool_call_gave_up": False, "answer": result}
+
     print("\n=== stopped: hit MAX_STEPS without a final answer ===")
     if speak_answer:
         voice.speak("I stopped without a final answer, I hit my step limit.")
     return {"tool_call_gave_up": had_malformed_attempt, "answer": final_answer}
 
 
-def run_task(task: str, speak_answer: bool = False) -> None:
-    """One-shot: fresh conversation, single task, then exit. Routes
-    through the fast lane (small model, isolated Nvidia GPU, tight tool
-    leash, no vault dump) when router.classify() marks the request FAST -
-    see FAST_OLLAMA_URL's own comment for why. Falls through to the full
-    model if the fast lane's own Ollama instance isn't reachable, rather
-    than failing the request outright. Also falls through when the fast
-    lane's small model proves it can't format a tool call this turn -
+def run_task(
+    task: str, speak_answer: bool = False, history: list | None = None
+) -> None:
+    """One-shot by default: fresh conversation, single task, then exit.
+    Routes through the fast lane (small model, isolated Nvidia GPU, tight
+    tool leash, no vault dump) when router.classify() marks the request
+    FAST - see FAST_OLLAMA_URL's own comment for why. Falls through to the
+    full model if the fast lane's own Ollama instance isn't reachable,
+    rather than failing the request outright. Also falls through when the
+    fast lane's small model proves it can't format a tool call this turn -
     retrying a model that just garbled the format is burning time; the
     full model gets the same request with full context instead. The fast
     lane always runs silent: if it gave up, its give-up text is NOT
     spoken, the full model's answer is the only thing Mark hears. One
-    spoken answer per task, never two back to back."""
+    spoken answer per task, never two back to back.
+
+    `history`, when given, is a persistent messages list (system prompt +
+    accumulated turns) that this call appends to and reuses, instead of
+    building a throwaway one-shot conversation - the fast lane above is
+    untouched by this and stays context-free by design either way. Real
+    incident, 2026-09-17: every voice command used to get a brand-new,
+    empty conversation here, so a command using "it"/"that"/"the same
+    one" had nothing to resolve the reference against and the model
+    invented one. run_voice_loop passes its own persistent `history` list
+    so consecutive voice commands finally share real memory, the same way
+    run_chat's turns always have."""
     if router.classify(task) == router.FAST:
         print(f"\n[router] classified FAST -> {FAST_MODEL} on the isolated GPU")
         fast_messages = [
@@ -556,16 +592,23 @@ def run_task(task: str, speak_answer: bool = False) -> None:
                     voice.speak(turn_result["answer"])
                 return
 
-    messages = [
-        {"role": "system", "content": _build_system_prompt()},
-        {"role": "user", "content": task},
-    ]
+    if history is not None:
+        history[0] = {"role": "system", "content": _build_system_prompt()}
+        messages = history
+        messages.append({"role": "user", "content": task})
+    else:
+        messages = [
+            {"role": "system", "content": _build_system_prompt()},
+            {"role": "user", "content": task},
+        ]
     try:
         _agentic_turn(messages, speak_answer, task_desc=task)
     except OllamaUnavailable as e:
         print(f"\n=== error ===\n{e}")
         if speak_answer:
             voice.speak("I can't reach Ollama right now. Is it running?")
+        if history is not None:
+            messages.pop()  # drop the unanswered user turn, retry cleanly next time
 
 
 def _startup_sitrep() -> None:
@@ -629,10 +672,17 @@ def run_chat() -> None:
 
 def run_voice_loop() -> None:
     """Push-to-talk loop: hold the PTT key, speak your task, release, get a
-    spoken answer, repeat. Ctrl+C to exit."""
+    spoken answer, repeat. Ctrl+C to exit.
+
+    Keeps one persistent `history` list across every PTT command in this
+    session, the same way run_chat's own `messages` persists across typed
+    turns - see run_task's docstring for the 2026-09-17 incident this
+    closes. Only the full-model path shares this memory; the fast lane
+    stays its own context-free conversation every time, by design."""
     start_relay_server()
     _startup_sitrep()
     print(f"Voice mode (push-to-talk, {voice.PTT_KEY}). Ctrl+C to exit.")
+    history = [{"role": "system", "content": _build_system_prompt()}]
     while True:
         text = voice.listen_ptt()
         if not text:
@@ -641,7 +691,7 @@ def run_voice_loop() -> None:
         if text.strip().lower() in ("stop listening", "stop", "exit", "quit"):
             voice.speak("Stopping.")
             return
-        run_task(text, speak_answer=True)
+        run_task(text, speak_answer=True, history=history)
 
 
 # Tools allowed on a relay-triggered turn: read/search/log only. No
