@@ -89,6 +89,28 @@ _FAKE_TOOL_CALL_RE = re.compile(r"<function[=\s]", re.IGNORECASE)
 # a bare "try again."
 _FUNCTION_NAME_RE = re.compile(r"<function[=\s]+([\w\-]+)", re.IGNORECASE)
 
+# Real incident, 2026-09-17: told to give a face a blue motif, the model
+# switched to a differently-named pre-existing face (set_face) instead of
+# editing the requested face's own index.html, then confidently claimed
+# the restyle was done. Prompt-only guidance describing the right way to
+# do this (added the same night) did NOT fix it - live-retested against
+# the real model, same wrong behavior, same false claim. Same lesson as
+# every other guard in this file: this model doesn't reliably hold an
+# instruction on its own, the friction has to live in code. This regex
+# flags a final answer claiming a face's actual look/color changed;
+# paired with `edited_face_file` (set in the tool-dispatch loop below)
+# to catch a claim with no real write_file/edit_file behind it.
+_FACE_LOOK_CLAIM_RE = re.compile(
+    r"\bface\b.{0,60}\b(motif|colou?r|palette|theme|scheme|hue|tint)\b"
+    r"|\b(motif|colou?r|palette|theme|scheme|hue|tint)\b.{0,60}\bface\b",
+    re.IGNORECASE,
+)
+
+
+def _touches_face_file(path_str: str) -> bool:
+    return bool(re.search(r"faces[\\/]", path_str, re.IGNORECASE))
+
+
 SYSTEM_PROMPT = (
     "You are a local agent running mostly offline. You have tools to read, "
     "write, and edit files, search files by name or content, run shell "
@@ -110,6 +132,21 @@ SYSTEM_PROMPT = (
     "start up, what you say, or how you behave, actually make the edit "
     "instead of reflexively saying you can't modify yourself - that "
     "reflex is wrong here and has caused a real false refusal before.\n\n"
+    "Your visual face works the same way. Each face is its own folder "
+    "under visualizer/faces/<name>/ - the whole look (colors, motif, "
+    "layout) lives in that face's index.html, mostly as CSS custom "
+    "properties near the top (e.g. a hex color variable per accent). "
+    "set_face and show_face only ever change WHICH face is showing or "
+    "bring the current one to the front - neither one can change what a "
+    "face looks like, and switching to a different pre-existing face "
+    "that happens to share a color or name is never a real substitute "
+    "for actually restyling the one Mark asked about. A request like "
+    "'give the aether face a blue motif' or 'make X look like Y' is a "
+    "file-edit task: read that exact face's index.html and edit its "
+    "actual color values with write_file/edit_file. If you switch faces "
+    "instead of editing one because that felt like the closer available "
+    "action, you've answered a different request than the one asked - "
+    "say so plainly rather than reporting it as done.\n\n"
     "You also have real persistent memory across separate conversations "
     "- this is not a stateless chatbot. TASKS.md tracks open and "
     "completed work, LESSONS.md tracks what you've learned, and the "
@@ -313,6 +350,17 @@ def _agentic_turn(
     malformed_retries = 0
     MAX_GIVE_UP_RETRIES = 2
 
+    # Real incident, 2026-09-17: asked to give a face a blue motif, the
+    # model switched to a differently-named existing face instead of
+    # editing the requested one's index.html, then claimed the restyle
+    # was done. Tracks whether a write_file/edit_file call actually
+    # touched a face's own file this turn, so a final answer claiming a
+    # face's look/color changed with no such edit behind it can be
+    # caught instead of trusted. One retry only - see _FACE_LOOK_CLAIM_RE.
+    edited_face_file = False
+    style_claim_retries = 0
+    MAX_STYLE_CLAIM_RETRIES = 1
+
     for step in range(1, MAX_STEPS + 1):
         print(f"\n--- step {step}: asking {model} ---")
         response = call_ollama(messages, allowed_tools, model=model, url=url)
@@ -471,6 +519,61 @@ def _agentic_turn(
                 # above is unaffected.
                 had_malformed_attempt = True
 
+            # Real incident, 2026-09-17: told to give a face a blue motif,
+            # the model switched to a differently-named existing face
+            # instead of editing the requested one's own index.html, then
+            # claimed the restyle was done - a false completion claim, not
+            # a failed tool call, so none of the guards above catch it.
+            # Prompt-only guidance describing the right way to do this
+            # (added the same night) did not stop it on a live retest, so
+            # this is enforced in code: a final answer claiming a face's
+            # actual look/color changed with no write_file/edit_file
+            # having touched that face's file this turn gets one retry
+            # with an explicit correction, then an honest replacement if
+            # it still hasn't actually done it.
+            if _FACE_LOOK_CLAIM_RE.search(answer) and not edited_face_file:
+                if style_claim_retries < MAX_STYLE_CLAIM_RETRIES and step < MAX_STEPS:
+                    style_claim_retries += 1
+                    print(
+                        "\n(final answer claims a face's look/color "
+                        "changed but no write_file/edit_file touched a "
+                        f"face file this turn - forcing a retry, raw "
+                        f"text: {answer!r})"
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "That's not true - you described changing "
+                                "a face's color/motif/style, but nothing "
+                                "this turn actually edited that face's "
+                                "file. Switching to a different existing "
+                                "face is never the same as restyling the "
+                                "one asked about. Actually read the "
+                                "requested face's visualizer/faces/<name>/"
+                                "index.html and edit its real color values "
+                                "with write_file/edit_file, or say plainly "
+                                "that you haven't done it."
+                            ),
+                        }
+                    )
+                    continue
+                print(
+                    "\n(final answer still falsely claims a face restyle "
+                    f"with no real edit behind it after "
+                    f"{MAX_STYLE_CLAIM_RETRIES} retry - replacing it "
+                    f"instead of speaking it, it was: {answer!r})"
+                )
+                answer = (
+                    "I said I changed how a face looks, but that wasn't "
+                    "true - I didn't actually edit that face's file. "
+                    "Changing a face's look needs an actual edit to its "
+                    "visualizer/faces/<name>/index.html, not a switch to "
+                    "a different face. Try asking me again."
+                )
+                messages[-1]["content"] = answer
+                had_malformed_attempt = True
+
             print(f"\n=== answer ===\n{answer}")
             if speak_answer:
                 voice.speak(answer)  # sets its own speaking/idle bus state
@@ -507,6 +610,16 @@ def _agentic_turn(
             print(f"tool result: {result[:500]}")
 
             messages.append({"role": "tool", "content": result, "name": name})
+
+            # Tracks a real, successful edit to a face's own file this
+            # turn - see _FACE_LOOK_CLAIM_RE above for why this matters.
+            if (
+                name in ("write_file", "edit_file")
+                and isinstance(result, str)
+                and result.startswith("OK")
+                and _touches_face_file(str(args.get("path", "")))
+            ):
+                edited_face_file = True
 
             # A BLOCKED result means a disruptive-action gate just fired
             # (write_file/edit_file's source-code gate, run_shell's
