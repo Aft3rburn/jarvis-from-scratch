@@ -52,6 +52,27 @@ class TestRouterClassify(unittest.TestCase):
                     f"{text!r} should stay on the full model - it needs real reasoning",
                 )
 
+    def test_memory_questions_are_full(self):
+        # The fast lane deliberately loads no vault/task/lesson context,
+        # so a memory question answered there reads as the assistant
+        # "forgetting" Mark (reported 2026-09-13). Several of these were
+        # FAST before the memory-keyword rule (short, no complex keyword).
+        memory_questions = [
+            "do you remember what we worked on yesterday",
+            "what did I ask you to do earlier",
+            "what's on my todo list",
+            "did you forget about the backup task",
+            "recall what you told me last night",
+            "what did we discuss last week",
+        ]
+        for text in memory_questions:
+            with self.subTest(text=text):
+                self.assertEqual(
+                    classify(text), FULL,
+                    f"{text!r} should stay on the full model - "
+                    "the fast lane has no memory",
+                )
+
     def test_long_message_defaults_full_even_without_keywords(self):
         long_text = (
             "I was thinking about the whole situation with the backup task "

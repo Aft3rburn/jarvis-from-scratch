@@ -310,13 +310,10 @@ def _real_tool_call_message(tool_name, args=None):
 class TestFabricationGiveUpGate(unittest.TestCase):
     def test_fabricated_giveup_gets_overwritten_honestly(self):
         """One garbled attempt, then it gives up and fabricates an excuse
-        - MAX_GIVE_UP_RETRIES (2) more chances get forced, and only once
-        that budget is spent does the honest fallback take over. Matches
-        agent.py's actual retry math (verified by running this test
-        against a wrong call count first - see the failed first draft):
-        malformed -> continue; 1st give-up plain text -> retries=1,
-        continue; 2nd give-up plain text -> retries=2, continue; 3rd
-        give-up plain text -> retries>=MAX, overwrite. 4 calls total."""
+        - the retry budget gets forced, and once spent the honest fallback
+        takes over. Matches agent.py's actual retry math: malformed ->
+        nudge (retries=1); excuse -> forced retry (retries=2); excuse ->
+        budget spent (2>=MAX_GIVE_UP_RETRIES), overwrite. 3 calls total."""
         excuse = (
             "I cannot execute the tool call due to interface "
             "limitations in this environment."
@@ -339,10 +336,16 @@ class TestFabricationGiveUpGate(unittest.TestCase):
             "answer honest, stored history still held the lie)."
         )
         self.assertIn(
-            "don't know why", final.lower(),
-            "expected the honest fallback line, got: " + repr(final),
+            "show_face", final,
+            "the honest fallback names the tool it was trying to call, so "
+            "Mark knows what to retry - got: " + repr(final),
         )
-        self.assertEqual(scripted.calls, 4)
+        self.assertIn(
+            "try asking me again", final.lower(),
+            "the fallback must suggest a retry instead of dead-ending at "
+            "'needs a person' - got: " + repr(final),
+        )
+        self.assertEqual(scripted.calls, 3)
 
     def test_self_correction_after_one_garble_passes_through(self):
         """Garbles once, then self-corrects into a REAL tool call - must
@@ -487,15 +490,19 @@ class TestUniversalCapabilityNet(unittest.TestCase):
             "even when it arrives on the very last step of the loop's "
             "step budget - got: " + repr(final),
         )
-        self.assertIn("don't know why", final.lower())
+        self.assertIn("run_shell", final)
+        self.assertIn("try asking me again", final.lower())
 
     def test_honest_final_answer_at_maxsteps_untouched(self):
-        """Same shape (fake-call spam all the way to MAX_STEPS) but the
-        final content is an honest, non-fabricating answer - must pass
-        through as-is, the net shouldn't rewrite everything."""
+        """An honest, non-fabricating final answer must pass through the
+        capability-claim net as-is - the net rewrites fabrications, not
+        everything. (The 'fake-call spam all the way to MAX_STEPS' shape
+        this test originally scripted can't occur anymore: the shared
+        retry budget from the 2026-09-12 fix caps the spiral at 3 model
+        calls, so a step-30 honest answer is unreachable. This keeps the
+        test's intent - the net's precision - in a reachable scenario.)"""
         scripted = _ScriptedOllama(
-            [_malformed_text_message("run_shell") for _ in range(agent.MAX_STEPS - 1)]
-            + [_plain_text_message("Here's the disk usage you asked for.")]
+            [_plain_text_message("Here's the disk usage you asked for.")]
         )
         messages = [{"role": "user", "content": "check disk space"}]
         with patch.object(agent, "call_ollama", scripted):
@@ -575,6 +582,129 @@ class TestOpsMonitorInputHardening(unittest.TestCase):
             result = ops_monitor.check_gpu_nvidia({})
         self.assertIn("temperature 44C", result)
         self.assertIn("utilization 87%", result)
+
+
+# ---------------------------------------------------------------------------
+# Regression 7: fast-lane give-up must escalate with exactly one spoken
+# answer (2026-09-13). run_task used to hand speak_answer=True straight
+# into the fast lane's _agentic_turn, so when the small model gave up,
+# the turn SPOKE the give-up text - and then run_task escalated to the
+# full model, which spoke its own answer. Mark heard two responses back
+# to back for one request. Fix: the fast lane always runs silent; its
+# turn returns the answer text, and run_task does the single speak only
+# when it's NOT escalating.
+# ---------------------------------------------------------------------------
+class _ModelRoutingOllama:
+    """One mock serving both of run_task's lanes: picks its scripted
+    responses by the model kwarg _agentic_turn passes through."""
+    def __init__(self, scripts):
+        self._scripts = {m: list(rs) for m, rs in scripts.items()}
+        self.calls = []
+
+    def __call__(self, messages, allowed_tools=None, model=None, url=None):
+        self.calls.append(model)
+        queue = self._scripts.get(model, [])
+        if not queue:
+            raise AssertionError(
+                f"no scripted responses left for model {model!r} "
+                f"after {len(self.calls)} calls"
+            )
+        return {"message": queue.pop(0)}
+
+
+def _give_up_script(tool_name="show_face"):
+    """The exact shape the 2026-09-13 fix handles: one garbled attempt,
+    then excuses until the retry budget is spent and the honest fallback
+    takes over. 3 model calls, matching TestFabricationGiveUpGate's math."""
+    excuse = (
+        "I cannot execute the tool call due to interface "
+        "limitations in this environment."
+    )
+    return [
+        _malformed_text_message(tool_name),  # attempt 1: garbled syntax
+        _plain_text_message(excuse),          # give-up 1/2: forced retry
+        _plain_text_message(excuse),          # give-up 2/2: budget spent
+    ]
+
+
+class TestFastLaneEscalationSpeaksOnce(unittest.TestCase):
+    def _run(self, scripts, task="bring up your face"):
+        ollama = _ModelRoutingOllama(scripts)
+        with patch.object(agent.router, "classify", return_value=agent.router.FAST), \
+             patch.object(agent, "call_ollama", ollama), \
+             patch.object(agent, "_build_system_prompt", return_value="stub"), \
+             patch.object(agent.voice, "speak") as speak_mock:
+            agent.run_task(task, speak_answer=True)
+        return ollama, speak_mock
+
+    def test_give_up_escalates_and_speaks_only_the_full_answer(self):
+        """Fast lane garbles its tool call and gives up - run_task must
+        escalate to the full model, and Mark must hear exactly ONE
+        spoken answer: the full model's, never the give-up text."""
+        full_answer = "Your face is up now."
+        ollama, speak_mock = self._run({
+            agent.FAST_MODEL: _give_up_script(),
+            agent.MODEL: [_plain_text_message(full_answer)],
+        })
+
+        self.assertIn(
+            agent.MODEL, ollama.calls,
+            "the full model must be asked after the fast lane gives up - "
+            f"calls went to: {ollama.calls}",
+        )
+        self.assertEqual(
+            speak_mock.call_count, 1,
+            "exactly one thing may be spoken per task - the old code "
+            f"spoke the give-up AND the full answer: {speak_mock.call_args_list}",
+        )
+        spoken = speak_mock.call_args_list[0][0][0]
+        self.assertEqual(
+            spoken, full_answer,
+            "the single spoken answer must be the full model's, not the "
+            f"fast lane's give-up text - got: {spoken!r}",
+        )
+
+    def test_fast_lane_success_speaks_fast_answer_once_no_escalation(self):
+        """Fast lane answers cleanly - its answer is spoken exactly once
+        and the full model is never woken up."""
+        fast_answer = "It's currently 3:15 PM."
+        ollama, speak_mock = self._run({
+            agent.FAST_MODEL: [_plain_text_message(fast_answer)],
+            agent.MODEL: [_plain_text_message("SHOULD NEVER BE CALLED")],
+        }, task="what time is it")
+
+        self.assertNotIn(
+            agent.MODEL, ollama.calls,
+            "a clean fast-lane answer must not escalate - "
+            f"calls went to: {ollama.calls}",
+        )
+        self.assertEqual(speak_mock.call_count, 1)
+        self.assertEqual(
+            speak_mock.call_args_list[0][0][0], fast_answer,
+            "the fast lane's own answer is what gets spoken - got: "
+            f"{speak_mock.call_args_list[0][0][0]!r}",
+        )
+
+    def test_silent_task_never_speaks_even_on_escalation(self):
+        """run_task(speak_answer=False) - e.g. relay/one-shot callers that
+        only want the side effects - must not speak at all, even when the
+        fast lane gives up and the full model answers."""
+        ollama = _ModelRoutingOllama({
+            agent.FAST_MODEL: _give_up_script(),
+            agent.MODEL: [_plain_text_message("Full answer.")],
+        })
+        with patch.object(agent.router, "classify", return_value=agent.router.FAST), \
+             patch.object(agent, "call_ollama", ollama), \
+             patch.object(agent, "_build_system_prompt", return_value="stub"), \
+             patch.object(agent.voice, "speak") as speak_mock:
+            agent.run_task("bring up your face", speak_answer=False)
+
+        self.assertEqual(
+            speak_mock.call_count, 0,
+            "a silent task must stay silent through escalation - "
+            f"spoken: {speak_mock.call_args_list}",
+        )
+        self.assertIn(agent.MODEL, ollama.calls)
 
 
 if __name__ == "__main__":

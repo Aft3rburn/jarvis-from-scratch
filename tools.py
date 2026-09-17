@@ -177,7 +177,9 @@ _CAPABILITY_PHRASE = (
 )
 _NEGATION_PHRASE = (
     r"(?:can'?t|cannot|unable|persistent failure|limitation|doesn'?t work|"
-    r"not (?:something|possible))"
+    r"not (?:something|possible)|prevents? (?:\w+\s+)?from|"
+    r"misinterpret\w*|interpretation issue|isn'?t (?:being )?"
+    r"(?:recognized|received|processed|going through))"
 )
 _GAP = r"(?:(?!\.\s|\n).){0,150}?"
 

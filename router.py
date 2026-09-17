@@ -12,14 +12,12 @@ second model or a learned classifier, per the roadmap's explicit
 sequencing: start dumb and cheap, only escalate if the heuristic proves
 too sloppy in real use.
 
-*** NOT YET WIRED INTO agent.py. *** This is deliberate — actually routing
-requests needs a second, small model pulled and benched on AI-Server first
-(folds into the local-LLM-watch item in Active Priorities), and wiring
-`classify()` into call_ollama's model selection is a real .py edit to a
-live production file, which needs Mark's explicit confirm per the
-source-edit rule, done live on AI-Server where it can be verified against
-real hardware and a real second model. This file is the scaffolding for
-that session to review, bench, and wire in - not a finished feature.
+*** WIRED INTO agent.py's run_task() since 2026-09-12. *** The wiring
+happened live on AI-Server with Mark's explicit confirm per the
+source-edit rule, after llama3.2:3b was pulled and benched on the isolated
+GPU (127.0.0.1:11435). The sequencing caution in the next paragraph still
+applies to any future heuristic change: bench against realistic traffic
+first.
 
 Real risk this heuristic exists to manage, stated plainly rather than
 glossed over: a false "fast" classification sends a genuinely complex
@@ -31,6 +29,20 @@ one risks a bad or fabricated answer.
 """
 
 import re
+
+# Real incident, 2026-09-12: a plain "open the X face" command went FAST
+# (short, no complex keyword) and llama3.2:3b picked show_face (just
+# refocus the window) over set_face (actually switch) - twice in one
+# night, even after the fast-lane prompt was clarified. set_face on the
+# full 30B model got it right both times it ran instead. A bare "show me
+# your face"/"show your status" (no switch implied) is left alone here -
+# that's genuinely fine on the fast lane, and is the existing simple
+# pattern below. Only a request that names/implies switching to a
+# specific face is forced FULL, regardless of length.
+_FACE_SWITCH_RE = re.compile(
+    r"\b(open|switch(?:\s+to)?|change|set|bring up|pull up)\b.{0,30}\bface\b",
+    re.IGNORECASE,
+)
 
 # Any of these appearing anywhere in the request is a strong signal it
 # needs real reasoning, generation, or multi-step work - never fast-path
@@ -45,6 +57,23 @@ _COMPLEX_KEYWORDS_RE = re.compile(
     r"summar\w*|draft|"
     r"script|function|class|algorithm|regex|query|"
     r"and then|after that|step by step|multi-step"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Memory questions must never fast-path: the fast lane deliberately loads
+# no vault/task/lesson context (see FAST_SYSTEM_PROMPT in agent.py), so a
+# memory question answered there reads as the assistant "forgetting" Mark
+# (reported 2026-09-13). A false positive here just costs a little latency
+# on the 30B; a false negative is a confident answer from nothing.
+_MEMORY_KEYWORDS_RE = re.compile(
+    r"\b("
+    r"remember|remembers|remembered|recall|recalled|"
+    r"forgot|forgotten|forget|"
+    r"yesterday|earlier|previously|"
+    r"last (night|week|time)|"
+    r"\btodo\b|to-?do list|my tasks?|my notes?|"
+    r"what did i|what have i"
     r")\b",
     re.IGNORECASE,
 )
@@ -78,7 +107,13 @@ def classify(text: str) -> str:
     if not stripped:
         return FAST  # empty/no-op input, nothing to reason about either way
 
+    if _FACE_SWITCH_RE.search(stripped):
+        return FULL
+
     if _COMPLEX_KEYWORDS_RE.search(stripped):
+        return FULL
+
+    if _MEMORY_KEYWORDS_RE.search(stripped):
         return FULL
 
     word_count = len(stripped.split())

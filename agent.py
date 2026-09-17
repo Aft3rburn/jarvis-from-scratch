@@ -60,10 +60,22 @@ FAST_SYSTEM_PROMPT = (
     "bounded command or status check - not a full conversation. You have "
     "a few tools to check disk space, GPU status, scheduled tasks, open "
     "tasks, and your own visual face; use one if the request actually "
-    "needs real data, otherwise just answer directly. One short spoken "
-    "sentence. No markdown, no lists, no explanation beyond the answer "
-    "itself. If you genuinely don't know something (e.g. the weather, "
-    "with no tool for it), say so plainly instead of guessing."
+    "needs real data, otherwise just answer directly. "
+    "Face tools: set_face actually switches which face is showing - use "
+    "it for 'open/switch to/show me the X face'. show_face only brings "
+    "an already-active face's window to the front, it does NOT change "
+    "what's showing - never use it as a substitute for set_face. Face "
+    "names are lowercase words joined with underscores, not spaces - "
+    "e.g. spoken 'blue board' is the face 'blue_board'. Convert what "
+    "you hear into that slug shape before calling set_face; call "
+    "list_faces first if you're not sure of the exact name. "
+    "One short spoken sentence. No markdown, no lists, no explanation "
+    "beyond the answer itself. If a tool result has no data in it (e.g. "
+    "a plain confirmation like a face switch), just confirm what you "
+    "did in your own words - never state a number or fact that wasn't "
+    "actually in the tool result. If you genuinely don't know something "
+    "(e.g. the weather, with no tool for it), say so plainly instead of "
+    "guessing."
 )
 
 # Sometimes the model writes a tool call out as plain text (e.g.
@@ -211,13 +223,39 @@ def call_ollama(
         ) from e
 
 
+def _give_up_answer(task_desc: str | None, tool_name: str | None) -> str:
+    """What Mark hears when the model can't produce a real tool call after
+    the retry budget is spent. The old version said 'this needs a person
+    to look at directly' without saying what it was even trying to do,
+    which left Mark stuck (reported 2026-09-13). This names the tool and
+    the task so it's actionable, and says a retry usually works - because
+    this failure mode is intermittent local-model flakiness, not a real
+    outage, and 'try again' is genuinely the right next step."""
+    task_bit = (
+        f"trying to help with '{task_desc}'" if task_desc
+        else "working on your request"
+    )
+    tool_bit = (
+        f"get the '{tool_name}' tool call formatted correctly"
+        if tool_name
+        else "make the tool call I needed"
+    )
+    return (
+        f"I was {task_bit}, but I couldn't {tool_bit} after several "
+        f"tries. That's on my end, not yours - the local model I run on "
+        f"sometimes garbles tool calls. Try asking me again; it usually "
+        f"goes through on a retry."
+    )
+
+
 def _agentic_turn(
     messages: list,
     speak_answer: bool = False,
     allowed_tools: set | None = None,
     model: str = MODEL,
     url: str = OLLAMA_URL,
-) -> None:
+    task_desc: str | None = None,
+) -> dict:
     """Run the ask-model / execute-tools loop, appending to `messages` in
     place, until the model gives a final text answer (or MAX_STEPS is
     hit). Shared by one-shot tasks, the chat REPL, voice mode, subagents,
@@ -229,7 +267,20 @@ def _agentic_turn(
     are never even offered to the model (a smaller, honest schema list),
     and any tool call for a name outside the set is rejected at dispatch
     too, in case the model calls one anyway (e.g. carried over from
-    conversation history)."""
+    conversation history).
+
+    `task_desc` is a short human description of what this turn is trying
+    to do (normally the user's request text). It's only used to make the
+    give-up message actionable when the model can't format a tool call.
+
+    Returns {"tool_call_gave_up": bool, "answer": str | None} - True
+    when the turn ended with the model unable to produce a real tool
+    call (the give-up path), so callers like run_task's fast lane can
+    escalate to a stronger model instead of accepting the weak model's
+    failure. "answer" is the final text the turn produced (None when it
+    hit MAX_STEPS without one); run_task's fast lane uses it to speak
+    exactly once, after deciding whether to escalate, instead of the
+    turn speaking a give-up message that escalation then talks over."""
     bus.set_state("thinking")
 
     # Tracks a malformed (plain-text) tool call happening earlier this
@@ -244,7 +295,21 @@ def _agentic_turn(
     # broke anyway.
     had_malformed_attempt = False
     last_malformed_tool = None
-    give_up_retries = 0
+    # The final text answer, when the turn produces one. Returned to the
+    # caller (not just spoken) so run_task's fast lane can decide between
+    # speaking it and escalating to the full model - speaking inside the
+    # turn AND escalating would say two things back to back.
+    final_answer = None
+    # Real incident, 2026-09-12: this used to be two separate counters -
+    # the "wrote a fake call naming a real tool" branch below had NO cap
+    # of its own, only the "gave up in plain prose" branch did. As long
+    # as the model kept naming a DIFFERENT real tool each garbled attempt
+    # (set_face, then list_faces, then run_shell, then read_file...) it
+    # never tripped the give-up branch and burned 14 straight round-trips
+    # to the model on one request before landing a real call by chance.
+    # One shared counter now covers both branches - any malformed turn,
+    # whichever shape it takes, spends the same fixed retry budget.
+    malformed_retries = 0
     MAX_GIVE_UP_RETRIES = 2
 
     for step in range(1, MAX_STEPS + 1):
@@ -280,13 +345,18 @@ def _agentic_turn(
                 and name_match is not None
                 and name_match.group(1) in tools.REGISTRY
             )
-            if is_real_attempt and step < MAX_STEPS:
+            if (
+                is_real_attempt
+                and malformed_retries < MAX_GIVE_UP_RETRIES
+                and step < MAX_STEPS
+            ):
                 had_malformed_attempt = True
                 last_malformed_tool = name_match.group(1)
+                malformed_retries += 1
                 print(
                     "\n(model wrote a tool call as plain text instead of "
                     f"the real structured format - raw text: {answer!r} - "
-                    "nudging it to retry)"
+                    f"nudging it to retry, {malformed_retries}/{MAX_GIVE_UP_RETRIES})"
                 )
                 messages.append(
                     {
@@ -301,6 +371,13 @@ def _agentic_turn(
                 )
                 continue
 
+            # A real attempt landed here instead of the branch above only
+            # because the shared retry budget is already spent - fall
+            # through to the give-up path below rather than looping again.
+            if is_real_attempt:
+                had_malformed_attempt = True
+                last_malformed_tool = name_match.group(1)
+
             # The model stopped garbling the call and just answered in
             # prose instead - but a malformed attempt happened earlier
             # this same turn, so this is very likely giving up rather
@@ -309,14 +386,14 @@ def _agentic_turn(
             # crutch instead of a bare "try again."
             if (
                 had_malformed_attempt
-                and give_up_retries < MAX_GIVE_UP_RETRIES
+                and malformed_retries < MAX_GIVE_UP_RETRIES
                 and step < MAX_STEPS
             ):
-                give_up_retries += 1
+                malformed_retries += 1
                 print(
                     "\n(model gave a plain-text answer instead of retrying "
                     f"its tool call - raw text: {answer!r} - forcing "
-                    f"another retry, {give_up_retries}/{MAX_GIVE_UP_RETRIES})"
+                    f"another retry, {malformed_retries}/{MAX_GIVE_UP_RETRIES})"
                 )
                 schema_hint = ""
                 if last_malformed_tool:
@@ -350,18 +427,14 @@ def _agentic_turn(
             # hasn't produced a real tool call. Don't let the model's own
             # text reach Mark here - whatever it wrote is being discarded
             # in favor of an answer that's actually true.
-            if had_malformed_attempt and give_up_retries >= MAX_GIVE_UP_RETRIES:
+            if had_malformed_attempt and malformed_retries >= MAX_GIVE_UP_RETRIES:
                 print(
                     "\n(model still couldn't produce a real tool call "
                     f"after {MAX_GIVE_UP_RETRIES} extra retries - its own "
                     f"answer is being replaced instead of spoken, it was: "
                     f"{answer!r})"
                 )
-                answer = (
-                    "I tried to call the tool I needed multiple times and "
-                    "it didn't go through correctly. I don't know why - "
-                    "this needs a person to look at directly."
-                )
+                answer = _give_up_answer(task_desc, last_malformed_tool)
                 # Overwrite the stored history too, not just the local
                 # variable - otherwise the fabricated excuse still sits in
                 # `messages` for the model (and any transcript) to see,
@@ -372,12 +445,15 @@ def _agentic_turn(
             # Last-resort net, independent of the state machine above: no
             # matter which path got here, a final answer that fabricates
             # "tool calls / the interface can't do X" never reaches Mark's
-            # ears. Real incident, 2026-09-12: the model spiraled through
-            # every retry emitting fake-call syntax instead of a clean
-            # give-up (see is_real_attempt above), so give_up_retries never
-            # advanced past 0 and the check above never fired - this exact
-            # fabricated claim reached voice.speak() unfiltered. Reuses the
-            # same guard already trusted for append_lesson/append_daily_note
+            # ears. Real incident, 2026-09-12 (first cut): the model
+            # spiraled through every retry emitting fake-call syntax
+            # instead of a clean give-up (see is_real_attempt above), so
+            # the retry counter never advanced and the check above never
+            # fired - kept here as a second net now that the counter is
+            # shared and capped, since a slightly different phrasing (e.g.
+            # "prevents me from" instead of "can't") can still slip past
+            # _SELF_INCAPACITY_RE's own wordlist. Reuses the same guard
+            # already trusted for append_lesson/append_daily_note
             # (tools._capability_claim_guard) instead of a second, looser
             # pattern.
             if tools._capability_claim_guard(answer, verified=False):
@@ -385,19 +461,22 @@ def _agentic_turn(
                     "\n(final answer fabricates a self-incapacity claim - "
                     f"replacing it instead of speaking it, it was: {answer!r})"
                 )
-                answer = (
-                    "I tried to call the tool I needed multiple times and "
-                    "it didn't go through correctly. I don't know why - "
-                    "this needs a person to look at directly."
-                )
+                answer = _give_up_answer(task_desc, last_malformed_tool)
                 messages[-1]["content"] = answer
+                # Treat a fabricated incapacity claim like a give-up: the
+                # turn produced no usable result, so a fast-lane caller
+                # should escalate rather than accept the weak model's
+                # answer. Set here at turn end, so the retry state machine
+                # above is unaffected.
+                had_malformed_attempt = True
 
             print(f"\n=== answer ===\n{answer}")
             if speak_answer:
                 voice.speak(answer)  # sets its own speaking/idle bus state
             else:
                 bus.set_state("idle")
-            return
+            final_answer = answer
+            return {"tool_call_gave_up": had_malformed_attempt, "answer": final_answer}
 
         # A real structured tool call just came through, so the model has
         # already proven it can format one correctly this turn - the
@@ -406,7 +485,7 @@ def _agentic_turn(
         # real tool result. Reset it so a summary answer after a genuine
         # tool call is never mistaken for the fabrication pattern.
         had_malformed_attempt = False
-        give_up_retries = 0
+        malformed_retries = 0
 
         for call in tool_calls:
             name = call["function"]["name"]
@@ -431,6 +510,7 @@ def _agentic_turn(
     print("\n=== stopped: hit MAX_STEPS without a final answer ===")
     if speak_answer:
         voice.speak("I stopped without a final answer, I hit my step limit.")
+    return {"tool_call_gave_up": had_malformed_attempt, "answer": final_answer}
 
 
 def run_task(task: str, speak_answer: bool = False) -> None:
@@ -439,7 +519,13 @@ def run_task(task: str, speak_answer: bool = False) -> None:
     leash, no vault dump) when router.classify() marks the request FAST -
     see FAST_OLLAMA_URL's own comment for why. Falls through to the full
     model if the fast lane's own Ollama instance isn't reachable, rather
-    than failing the request outright."""
+    than failing the request outright. Also falls through when the fast
+    lane's small model proves it can't format a tool call this turn -
+    retrying a model that just garbled the format is burning time; the
+    full model gets the same request with full context instead. The fast
+    lane always runs silent: if it gave up, its give-up text is NOT
+    spoken, the full model's answer is the only thing Mark hears. One
+    spoken answer per task, never two back to back."""
     if router.classify(task) == router.FAST:
         print(f"\n[router] classified FAST -> {FAST_MODEL} on the isolated GPU")
         fast_messages = [
@@ -447,20 +533,34 @@ def run_task(task: str, speak_answer: bool = False) -> None:
             {"role": "user", "content": task},
         ]
         try:
-            _agentic_turn(
-                fast_messages, speak_answer, allowed_tools=FAST_SAFE_TOOLS,
-                model=FAST_MODEL, url=FAST_OLLAMA_URL,
+            turn_result = _agentic_turn(
+                fast_messages, False, allowed_tools=FAST_SAFE_TOOLS,
+                model=FAST_MODEL, url=FAST_OLLAMA_URL, task_desc=task,
             )
-            return
         except OllamaUnavailable as e:
             print(f"\n[router] fast lane unreachable ({e}), falling back to {MODEL}")
+        else:
+            if turn_result.get("tool_call_gave_up"):
+                print(
+                    f"\n[router] fast lane couldn't format a tool call - "
+                    f"escalating to {MODEL}"
+                )
+            elif turn_result.get("answer") is None:
+                print(
+                    f"\n[router] fast lane hit its step limit with no "
+                    f"answer - escalating to {MODEL}"
+                )
+            else:
+                if speak_answer:
+                    voice.speak(turn_result["answer"])
+                return
 
     messages = [
         {"role": "system", "content": _build_system_prompt()},
         {"role": "user", "content": task},
     ]
     try:
-        _agentic_turn(messages, speak_answer)
+        _agentic_turn(messages, speak_answer, task_desc=task)
     except OllamaUnavailable as e:
         print(f"\n=== error ===\n{e}")
         if speak_answer:
@@ -519,7 +619,7 @@ def run_chat() -> None:
         bus.set_usertext(user_input)
         messages.append({"role": "user", "content": user_input})
         try:
-            _agentic_turn(messages, speak_answer=True)
+            _agentic_turn(messages, speak_answer=True, task_desc=user_input)
         except OllamaUnavailable as e:
             print(f"\n=== error ===\n{e}")
             voice.speak("I can't reach Ollama right now. Is it running?")
@@ -584,7 +684,8 @@ def _handle_relay_message(text: str, sender_ip: str) -> None:
         {"role": "user", "content": text},
     ]
     try:
-        _agentic_turn(messages, speak_answer=True, allowed_tools=RELAY_SAFE_TOOLS)
+        _agentic_turn(messages, speak_answer=True, allowed_tools=RELAY_SAFE_TOOLS,
+                      task_desc=text)
     except OllamaUnavailable as e:
         print(f"[relay] couldn't answer, Ollama unavailable: {e}")
 
