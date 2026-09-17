@@ -14,3 +14,12 @@ bus/
 # a real licensing question rather than quietly ignoring one in a public
 # portfolio repo. bus.py (this project's own small module) stays tracked.
 visualizer/
+# Scratch/backup cruft from manual pre-edit backups and venv rebuilds -
+# never deliverables, just intermediates a session left behind.
+*.bak-*
+.venv_freeze*.txt
+.venv_uv_unsigned_backup/
+baseline_check/
+logs/
+*.jsonl
+_restart_log.txt
