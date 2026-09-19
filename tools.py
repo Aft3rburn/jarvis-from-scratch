@@ -312,10 +312,11 @@ def _shrink_block_message(path: pathlib.Path, content: str) -> str | None:
         f"would replace it with only {new_size} bytes - that wipes out "
         "almost everything in it. write_file overwrites the WHOLE file. "
         "To change part of a file, use edit_file with a small exact "
-        "old_string/new_string instead. If a near-total rewrite really is "
-        "intended, state the exact consequence to Mark as your answer (no "
-        "more tool calls that turn), wait for him to say yes, then call "
-        "again with the same arguments plus confirmed=true - not before."
+        "old_string/new_string instead. This block has NO confirmed=true "
+        "override - the model can set that flag itself, and did (aether "
+        "face, 2026-09-19), so it can't be what protects a file. If a "
+        "near-total rewrite really is intended, tell Mark and have Mary "
+        "do it."
     )
 
 
@@ -325,10 +326,9 @@ def write_file(args: dict) -> str:
     confirmed = bool(args.get("confirmed", False))
     if path.suffix in _SOURCE_CODE_SUFFIXES and not confirmed:
         return _source_edit_block_message(path, "write_file")
-    if not confirmed:
-        shrink = _shrink_block_message(path, content)
-        if shrink:
-            return shrink
+    shrink = _shrink_block_message(path, content)
+    if shrink:
+        return shrink
     if path.suffix in _SOURCE_CODE_SUFFIXES:
         err = _python_syntax_error(content, path)
         if err:
@@ -772,10 +772,9 @@ def edit_file(args: dict) -> str:
         )
 
     new_content = content.replace(old, new) if replace_all else content.replace(old, new, 1)
-    if not confirmed:
-        shrink = _shrink_block_message(path, new_content)
-        if shrink:
-            return shrink
+    shrink = _shrink_block_message(path, new_content)
+    if shrink:
+        return shrink
     if path.suffix in _SOURCE_CODE_SUFFIXES:
         err = _python_syntax_error(new_content, path)
         if err:
