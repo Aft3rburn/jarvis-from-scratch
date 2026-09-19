@@ -65,12 +65,65 @@ TOOLS = [
             },
         },
     },
+    # Real schemas copied verbatim from tools.py, not simplified stand-ins -
+    # the whole point of this axis is testing tool *pick* between three
+    # genuinely similar face tools, so the bench needs the same descriptions
+    # the real model sees in production.
+    {
+        "type": "function",
+        "function": {
+            "name": "list_faces",
+            "description": "List the visual faces actually available in your own gallery (visualizer/faces/) and which one is active. You have a real visual face - never claim you're text-only or have no visual presence, check here first.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_face",
+            "description": "Switch your active visual face to one already in visualizer/faces/ (call list_faces first to see real options). Handles the full switch itself - writes the config, restarts the visualizer server, and confirms the new face is actually live via /config - so no separate restart step is needed. Read the return value: it says plainly if verification timed out or failed rather than assuming success.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "face": {"type": "string", "description": "Name of an existing folder under visualizer/faces/, e.g. 'jarvis' or 'orbit'."},
+                },
+                "required": ["face"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "show_face",
+            "description": "Bring your own face's browser window to the front and center of the screen. Opens one first if none is currently open.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 TOOL_CASES = [
     ("SHOULD_CALL_NO_ARGS", "What's the current CPU usage on this machine?", "get_system_stats", None),
     ("SHOULD_NOT_CALL", "What is 2 + 2?", None, None),
     ("SHOULD_CALL_WITH_ARG", "Read the file at C:\\Users\\mwilo\\notes.txt for me.", "read_file", "C:\\Users\\mwilo\\notes.txt"),
+]
+
+# New axis, 2026-09-18: bare face-name disambiguation. Real incident this
+# mirrors - router.py forced FULL only when the literal word "face"
+# appeared, so a bare-name command like "pull up circuit" fell to the fast
+# lane, where llama3.2:3b has a documented history of picking show_face or
+# list_faces over the real set_face switch. router.py's fix (dynamic
+# face-name regex, see 2026-09-18 entry in This AI-Server) covers the
+# ROUTING half - this axis tests the other half: once a request DOES reach
+# a model with real face tools in hand, does it pick set_face correctly,
+# with no literal "face" word and no verb like "open"/"switch" spelling it
+# out plainly. This is exactly the kind of ambiguous-instruction/
+# wrong-tool-pick disambiguation the 2026-09-17 bench-axis item called for.
+FACE_TOOL_CASES = [
+    ("SHOULD_SET_FACE_BARE_NAME", "pull up circuit", "set_face", "circuit"),
+    ("SHOULD_SET_FACE_BARE_NAME", "bring up aether", "set_face", "aether"),
+    ("SHOULD_SET_FACE_BARE_NAME", "switch to tide", "set_face", "tide"),
+    ("SHOULD_SHOW_NOT_SET", "show me your face", "show_face", None),
+    ("SHOULD_LIST_NOT_SET", "what faces do you have available", "list_faces", None),
 ]
 
 FABRICATION_QUESTIONS = [
@@ -132,7 +185,7 @@ def run_coding_bench(model: str, think: bool = False) -> None:
 
 def run_tool_bench(model: str, think: bool = False) -> None:
     print(f"\n{'=' * 60}\nTOOL-CALLING BENCH: {model} (think={think})\n{'=' * 60}")
-    for kind, prompt, expected_tool, expected_arg in TOOL_CASES:
+    for kind, prompt, expected_tool, expected_arg in TOOL_CASES + FACE_TOOL_CASES:
         result = call(model, prompt, timeout=120, think=think, tools=TOOLS)
         msg = result.get("message", {})
         tool_calls = msg.get("tool_calls", []) or []
