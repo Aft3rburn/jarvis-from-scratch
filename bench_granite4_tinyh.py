@@ -126,6 +126,55 @@ FACE_TOOL_CASES = [
     ("SHOULD_LIST_NOT_SET", "what faces do you have available", "list_faces", None),
 ]
 
+# Two more axes from the original 2026-09-17 bench-axis scoping, built
+# 2026-09-18 alongside the bare-name cases above. Same tuple shape as
+# TOOL_CASES/FACE_TOOL_CASES, fed through the same run_tool_bench().
+
+# Real incident, 2026-09-17 ~3:30 AM: "make the ether face have a blue
+# motif" got set_face('blue_board') instead of an actual edit to aether's
+# own CSS - the model substituted a plausible-sounding wrong TOOL for a
+# task none of these tools can do at all. This bench has no write_file/
+# edit_file, so the closest faithful check is: does the model still reach
+# for set_face on a pure restyle request, or correctly recognize no
+# available tool does this.
+RESTYLE_VS_SWITCH_CASES = [
+    ("SHOULD_NOT_SET_FACE_RESTYLE", "give the aether face a blue motif", None, None),
+    ("SHOULD_NOT_SET_FACE_RESTYLE", "make the circuit face have a green color scheme", None, None),
+]
+
+# Real incident, 2026-09-16/17: Mark's own phrasing typo'd "aether" as
+# "ether" more than once. Tests whether a model recovers via a sensible
+# fuzzy match to a real face name instead of failing outright or
+# hallucinating a call with the typo'd name as a literal argument.
+TYPO_NAME_CASES = [
+    ("SHOULD_FUZZY_MATCH_SET_FACE", "pull up ether", "set_face", "aether"),
+    ("SHOULD_FUZZY_MATCH_SET_FACE", "switch to the ether face", "set_face", "aether"),
+]
+
+# Real incident, 2026-09-17 ~2 AM: asked "are you able to see the
+# Playwright MCP?", the model ran a bad search and hallucinated an
+# unrelated FFmpeg analysis; the NEXT turn ("install it as a tool")
+# invented a totally different fabricated task instead of continuing
+# either the Playwright or FFmpeg thread - it lost track of what it had
+# just been doing. Needs a real prior turn in the conversation to test,
+# so this axis gets its own multi-turn case shape and its own runner
+# (run_continuity_bench) rather than reusing TOOL_CASES' single-prompt
+# shape. Grading is qualitative (does the answer stay on the established
+# topic, does it invent an unrelated tool call) - printed for a human to
+# read, same as the fabrication bench below.
+CONTINUITY_CASES = [
+    {
+        "label": "playwright_install_continuity",
+        "messages": [
+            {"role": "user", "content": "Can you check whether the Playwright browser-control tool is available to you?"},
+            {"role": "assistant", "content": "I searched and found some files that reference Playwright automation."},
+            {"role": "user", "content": "Okay, go ahead and get it installed as one of your tools."},
+        ],
+        "topic_keywords": ["playwright"],
+        "note": "should stay on the Playwright thread from turn 1, not invent an unrelated task",
+    },
+]
+
 FABRICATION_QUESTIONS = [
     ("KNOWN", "What is Mark's favorite color?", "blue"),
     ("KNOWN", "What is Mark's hobby?", "woodworking"),
@@ -140,10 +189,10 @@ FABRICATION_QUESTIONS = [
 ]
 
 
-def call(model: str, prompt: str, timeout: int = 300, think: bool = None, tools: list = None) -> dict:
+def call(model: str, prompt: str = None, timeout: int = 300, think: bool = None, tools: list = None, messages: list = None) -> dict:
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages if messages is not None else [{"role": "user", "content": prompt}],
         "stream": False,
     }
     if think is not None:
@@ -185,7 +234,7 @@ def run_coding_bench(model: str, think: bool = False) -> None:
 
 def run_tool_bench(model: str, think: bool = False) -> None:
     print(f"\n{'=' * 60}\nTOOL-CALLING BENCH: {model} (think={think})\n{'=' * 60}")
-    for kind, prompt, expected_tool, expected_arg in TOOL_CASES + FACE_TOOL_CASES:
+    for kind, prompt, expected_tool, expected_arg in TOOL_CASES + FACE_TOOL_CASES + RESTYLE_VS_SWITCH_CASES + TYPO_NAME_CASES:
         result = call(model, prompt, timeout=120, think=think, tools=TOOLS)
         msg = result.get("message", {})
         tool_calls = msg.get("tool_calls", []) or []
@@ -199,6 +248,28 @@ def run_tool_bench(model: str, think: bool = False) -> None:
         else:
             content = msg.get("content", "").strip().replace("\n", " ")
             print(f"  -> NO TOOL CALL, direct answer: {content[:200]}")
+        print()
+
+
+def run_continuity_bench(model: str, think: bool = False) -> None:
+    print(f"\n{'=' * 60}\nTASK-CONTINUITY BENCH: {model} (think={think})\n{'=' * 60}")
+    for case in CONTINUITY_CASES:
+        result = call(model, messages=case["messages"], timeout=180, think=think, tools=TOOLS)
+        msg = result.get("message", {})
+        tool_calls = msg.get("tool_calls", []) or []
+        content = msg.get("content", "").strip()
+        stayed_on_topic = any(kw.lower() in content.lower() for kw in case["topic_keywords"])
+        print(f"[{case['label']}]")
+        for m in case["messages"]:
+            print(f"  {m['role']}: {m['content']}")
+        print(f"  note: {case['note']}")
+        if tool_calls:
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                print(f"  -> CALLED: {fn.get('name')}({fn.get('arguments')})")
+        else:
+            print(f"  -> answer: {content[:300]!r}")
+        print(f"  -> stayed on topic (mentions {case['topic_keywords']}): {stayed_on_topic}")
         print()
 
 
@@ -220,6 +291,9 @@ if __name__ == "__main__":
     elif stage == "tools":
         run_tool_bench(BASELINE, think=None)
         run_tool_bench(MODEL, think=False)
+    elif stage == "continuity":
+        run_continuity_bench(BASELINE, think=None)
+        run_continuity_bench(MODEL, think=False)
     else:
         print(f"unknown stage: {stage}")
         sys.exit(1)
