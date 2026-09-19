@@ -707,5 +707,27 @@ class TestFastLaneEscalationSpeaksOnce(unittest.TestCase):
         self.assertIn(agent.MODEL, ollama.calls)
 
 
+class FaceLookClaimRegexTests(unittest.TestCase):
+    """2026-09-18: 'updated circuit face with double the traces' claims
+    slipped past the original color/motif-only regex."""
+
+    def test_trace_and_update_claims_are_flagged(self):
+        for text in (
+            "Here is the updated 'circuit' face with double the amount of traces.",
+            "The circuit face has been updated to include four times more traces.",
+            "The background image now includes double the amount of traces.",
+            "I gave the aether face a blue motif.",
+        ):
+            self.assertTrue(agent._FACE_LOOK_CLAIM_RE.search(text), text)
+
+    def test_plain_switch_and_status_answers_pass(self):
+        for text in (
+            "Your active visual face is currently set to 'circuit'.",
+            "Switched the face to circuit.",
+            "Your face window is now in front, centered on screen.",
+        ):
+            self.assertFalse(agent._FACE_LOOK_CLAIM_RE.search(text), text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

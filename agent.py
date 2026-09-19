@@ -100,9 +100,23 @@ _FUNCTION_NAME_RE = re.compile(r"<function[=\s]+([\w\-]+)", re.IGNORECASE)
 # flags a final answer claiming a face's actual look/color changed;
 # paired with `edited_face_file` (set in the tool-dispatch loop below)
 # to catch a claim with no real write_file/edit_file behind it.
+#
+# Widened 2026-09-18 after a second live incident: asked to double the
+# traces on the circuit face, the model only ever called set_face (a no-op
+# circuit->circuit restart) and show_face, then claimed "the updated
+# circuit face with double the amount of traces" four times running. None
+# of those words matched the original look-word list, so the claim sailed
+# through. The change-verbs/nouns below cover that shape; "switched" and
+# "changed" are deliberately NOT in the list, since a real set_face switch
+# legitimately reports exactly that.
+_FACE_LOOK_WORDS = (
+    r"motif|colou?r|palette|theme|scheme|hue|tint|traces?|denser|density"
+    r"|updated|edited|modified|redesigned|restyled|doubled|added|increased"
+)
 _FACE_LOOK_CLAIM_RE = re.compile(
-    r"\bface\b.{0,60}\b(motif|colou?r|palette|theme|scheme|hue|tint)\b"
-    r"|\b(motif|colou?r|palette|theme|scheme|hue|tint)\b.{0,60}\bface\b",
+    rf"\bface\b.{{0,60}}\b({_FACE_LOOK_WORDS})\b"
+    rf"|\b({_FACE_LOOK_WORDS})\b.{{0,60}}\bface\b"
+    r"|\b(double|doubled|more|denser|added|increased)\b.{0,40}\btraces?\b",
     re.IGNORECASE,
 )
 
@@ -545,7 +559,8 @@ def _agentic_turn(
                             "role": "user",
                             "content": (
                                 "That's not true - you described changing "
-                                "a face's color/motif/style, but nothing "
+                                "a face's look (color, motif, traces, "
+                                "density, anything), but nothing "
                                 "this turn actually edited that face's "
                                 "file. Switching to a different existing "
                                 "face is never the same as restyling the "
