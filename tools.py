@@ -289,12 +289,46 @@ def _python_syntax_error(content: str, path: pathlib.Path) -> str | None:
     return None
 
 
+_SHRINK_GUARD_MIN_BYTES = 2000
+_SHRINK_GUARD_RATIO = 0.2
+
+
+def _shrink_block_message(path: pathlib.Path, content: str) -> str | None:
+    """Returns a BLOCKED message if this write would replace a substantial
+    existing file with something under 20% of its size. Real incident,
+    2026-09-18: asked to work on the circuit face, the model overwrote the
+    39KB index.html with a 504-byte CSS snippet via write_file, then
+    claimed the face was edited. A genuine rewrite rarely shrinks a file
+    that hard; a clobber always does."""
+    try:
+        old_size = path.stat().st_size
+    except OSError:
+        return None
+    new_size = len(content.encode("utf-8"))
+    if old_size < _SHRINK_GUARD_MIN_BYTES or new_size >= old_size * _SHRINK_GUARD_RATIO:
+        return None
+    return (
+        f"BLOCKED: {path} is currently {old_size} bytes and this write "
+        f"would replace it with only {new_size} bytes - that wipes out "
+        "almost everything in it. write_file overwrites the WHOLE file. "
+        "To change part of a file, use edit_file with a small exact "
+        "old_string/new_string instead. If a near-total rewrite really is "
+        "intended, state the exact consequence to Mark as your answer (no "
+        "more tool calls that turn), wait for him to say yes, then call "
+        "again with the same arguments plus confirmed=true - not before."
+    )
+
+
 def write_file(args: dict) -> str:
     path = _resolve(args["path"])
     content = args.get("content", "")
     confirmed = bool(args.get("confirmed", False))
     if path.suffix in _SOURCE_CODE_SUFFIXES and not confirmed:
         return _source_edit_block_message(path, "write_file")
+    if not confirmed:
+        shrink = _shrink_block_message(path, content)
+        if shrink:
+            return shrink
     if path.suffix in _SOURCE_CODE_SUFFIXES:
         err = _python_syntax_error(content, path)
         if err:
@@ -707,6 +741,10 @@ def edit_file(args: dict) -> str:
         )
 
     new_content = content.replace(old, new) if replace_all else content.replace(old, new, 1)
+    if not confirmed:
+        shrink = _shrink_block_message(path, new_content)
+        if shrink:
+            return shrink
     if path.suffix in _SOURCE_CODE_SUFFIXES:
         err = _python_syntax_error(new_content, path)
         if err:
