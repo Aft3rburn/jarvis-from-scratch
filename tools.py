@@ -710,6 +710,37 @@ def search_files(args: dict) -> str:
     return "\n".join(hits)
 
 
+def _closest_lines_hint(content: str, old: str) -> str:
+    """When edit_file's old_string isn't found, points at the real lines
+    that look most like it, with line numbers. Real incident, 2026-09-18:
+    asked to double the traces on the circuit face, the model never read
+    the file and twice guessed an old_string (`#accent { color: ... }`)
+    that doesn't exist in it, so every edit failed with a bare 'not found'
+    and gave it nothing to correct from. Handing back the actual nearest
+    lines turns a dead end into a retry it can succeed at."""
+    import difflib
+    first = next((ln.strip() for ln in old.splitlines() if ln.strip()), "")
+    if not first:
+        return ""
+    lines = content.splitlines()
+    stripped = [ln.strip() for ln in lines]
+    close = difflib.get_close_matches(first, list(dict.fromkeys(stripped)), n=3, cutoff=0.4)
+    if not close:
+        return (
+            ". Nothing in the file resembles it - you are guessing. Use "
+            "read_file or search_files on this file first, then copy the "
+            "exact text you want to change."
+        )
+    shown = []
+    for c in close:
+        i = stripped.index(c)
+        shown.append(f"  line {i + 1}: {lines[i].strip()[:200]}")
+    return (
+        ". Closest real lines in the file (copy exact text from the "
+        "file, do not guess):\n" + "\n".join(shown)
+    )
+
+
 def edit_file(args: dict) -> str:
     """Exact old_string -> new_string replacement, same safety property as
     Mary's own Edit tool: refuses to guess when old_string isn't unique,
@@ -732,7 +763,7 @@ def edit_file(args: dict) -> str:
 
     count = content.count(old)
     if count == 0:
-        return f"ERROR: old_string not found in {path}"
+        return f"ERROR: old_string not found in {path}{_closest_lines_hint(content, old)}"
     if count > 1 and not replace_all:
         return (
             f"ERROR: old_string appears {count} times in {path} - not "
