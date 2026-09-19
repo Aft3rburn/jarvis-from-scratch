@@ -73,6 +73,29 @@ class TestRouterClassify(unittest.TestCase):
                     "the fast lane has no memory",
                 )
 
+    def test_face_switch_requests_are_full(self):
+        # Real incident, 2026-09-16: "bring up the circuit face" correctly
+        # forced FULL, but the exact same intent phrased without the word
+        # "face" ("pull up circuit") fell through to the fast lane, where
+        # llama3.2:3b has shown it can't reliably pick set_face over
+        # show_face/list_faces. Covers both the literal-"face" phrasing and
+        # the bare-face-name phrasing against real names from
+        # visualizer/faces/.
+        face_switch_requests = [
+            "open the circuit face",
+            "bring up the circuit face",
+            "pull up circuit",
+            "bring up aether",
+            "switch to aether",
+        ]
+        for text in face_switch_requests:
+            with self.subTest(text=text):
+                self.assertEqual(
+                    classify(text), FULL,
+                    f"{text!r} should stay on the full model - "
+                    "the fast lane picks the wrong face tool too often",
+                )
+
     def test_long_message_defaults_full_even_without_keywords(self):
         long_text = (
             "I was thinking about the whole situation with the backup task "

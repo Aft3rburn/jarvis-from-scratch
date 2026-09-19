@@ -29,6 +29,7 @@ one risks a bad or fabricated answer.
 """
 
 import re
+import pathlib
 
 # Real incident, 2026-09-12: a plain "open the X face" command went FAST
 # (short, no complex keyword) and llama3.2:3b picked show_face (just
@@ -43,6 +44,42 @@ _FACE_SWITCH_RE = re.compile(
     r"\b(open|switch(?:\s+to)?|change|set|bring up|pull up)\b.{0,30}\bface\b",
     re.IGNORECASE,
 )
+
+# Real gap flagged 2026-09-16: a request that names a face but drops the
+# literal word "face" entirely ("pull up circuit", "bring up aether") never
+# matched _FACE_SWITCH_RE above and slipped to the fast lane, which is the
+# same unreliable-tool-pick failure the module docstring already warns
+# about. Fix: read the real face names straight off visualizer/faces/ (same
+# trick tools.py's list_faces() already uses) so this stays correct as the
+# face library grows, instead of hardcoding a name list that goes stale.
+_VISUALIZER_FACES_DIR = pathlib.Path(__file__).parent / "visualizer" / "faces"
+
+
+def _face_names() -> list[str]:
+    if not _VISUALIZER_FACES_DIR.is_dir():
+        return []
+    return sorted(p.name for p in _VISUALIZER_FACES_DIR.iterdir() if p.is_dir())
+
+
+def _face_name_switch_pattern() -> "re.Pattern | None":
+    names = _face_names()
+    if not names:
+        return None
+    # Allow a face's own separator (_ or -) to also match a spoken space,
+    # since "blue_board" is far more likely spoken as "blue board".
+    alternation = "|".join(
+        re.escape(name).replace(r"\_", "[_ ]").replace(r"\-", "[\\- ]")
+        for name in names
+    )
+    return re.compile(
+        r"\b(open|switch(?:\s+to)?|change|set|bring up|pull up)\b.{0,15}\b("
+        + alternation
+        + r")\b",
+        re.IGNORECASE,
+    )
+
+
+_FACE_NAME_SWITCH_RE = _face_name_switch_pattern()
 
 # Any of these appearing anywhere in the request is a strong signal it
 # needs real reasoning, generation, or multi-step work - never fast-path
@@ -108,6 +145,9 @@ def classify(text: str) -> str:
         return FAST  # empty/no-op input, nothing to reason about either way
 
     if _FACE_SWITCH_RE.search(stripped):
+        return FULL
+
+    if _FACE_NAME_SWITCH_RE is not None and _FACE_NAME_SWITCH_RE.search(stripped):
         return FULL
 
     if _COMPLEX_KEYWORDS_RE.search(stripped):
