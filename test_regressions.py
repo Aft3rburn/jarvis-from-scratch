@@ -22,6 +22,8 @@ Session 37 proof scripts this suite makes permanent.
 
 import ast
 import inspect
+import tempfile
+import pathlib
 import json
 import unittest
 from unittest.mock import patch
@@ -817,6 +819,57 @@ class RemoteGraniteRoutingTests(unittest.TestCase):
         with patch.object(agent, "REMOTE_GRANITE_URL", "http://127.0.0.1:9/api/chat"),                 patch.object(agent, "REMOTE_CONNECT_TIMEOUT_S", 1):
             self.assertFalse(agent._remote_reachable())
         self.assertGreater(agent._remote_dead_until, agent.time.monotonic())
+
+
+class MemoryFileWriteBlockTests(unittest.TestCase):
+    """2026-09-20: asked to double the orbit face's swarm, the model
+    replaced a whole LESSONS.md paragraph via edit_file and claimed
+    success. The generic write/edit tools must never touch the memory
+    files, with no confirmed=true way around it. The block returns before
+    any file IO, so these tests never touch the real vault."""
+
+    def _blocked(self, result):
+        self.assertTrue(result.startswith("BLOCKED:"), result)
+        self.assertIn("memory files", result)
+
+    def test_edit_and_write_are_blocked_on_every_memory_file(self):
+        daily = str(tools.DAILY_DIR / "2026-09-20.md")
+        for target in (str(tools.LESSONS_FILE), str(tools.TASKS_FILE), daily):
+            self._blocked(tools.edit_file(
+                {"path": target, "old_string": "a", "new_string": "b"}))
+            self._blocked(tools.write_file({"path": target, "content": "x"}))
+
+    def test_relative_path_and_dotdot_traversal_are_blocked(self):
+        self._blocked(tools.edit_file(
+            {"path": "vault/LESSONS.md", "old_string": "a", "new_string": "b"}))
+        self._blocked(tools.edit_file(
+            {"path": "vault/daily/../LESSONS.md", "old_string": "a", "new_string": "b"}))
+        self._blocked(tools.write_file(
+            {"path": "vault/LESSONS.md".upper().replace("VAULT", "vault"), "content": "x"}))
+
+    def test_confirmed_true_is_not_an_override(self):
+        self._blocked(tools.edit_file({
+            "path": str(tools.LESSONS_FILE), "old_string": "a",
+            "new_string": "b", "confirmed": True}))
+        self._blocked(tools.write_file({
+            "path": str(tools.LESSONS_FILE), "content": "x", "confirmed": True}))
+
+    def test_block_message_names_the_right_tool(self):
+        self.assertIn("append_lesson", tools._memory_file_block_message(tools.LESSONS_FILE))
+        self.assertIn("complete_task", tools._memory_file_block_message(tools.TASKS_FILE))
+        self.assertIn("append_daily_note",
+                      tools._memory_file_block_message(tools.DAILY_DIR / "2026-09-20.md"))
+
+    def test_ordinary_files_and_index_are_not_blocked(self):
+        self.assertIsNone(tools._memory_file_block_message(tools.INDEX_FILE))
+        self.assertIsNone(tools._memory_file_block_message(
+            tools.WORKSPACE / "visualizer" / "faces" / "orbit" / "index.html"))
+        with tempfile.TemporaryDirectory() as d:
+            f = pathlib.Path(d) / "scratch.txt"
+            self.assertTrue(tools.write_file({"path": str(f), "content": "hi"}).startswith("OK:"))
+            self.assertTrue(tools.edit_file(
+                {"path": str(f), "old_string": "hi", "new_string": "yo"}).startswith("OK:"))
+            self.assertEqual(f.read_text(encoding="utf-8"), "yo")
 
 
 if __name__ == "__main__":

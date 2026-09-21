@@ -10,6 +10,7 @@ raw repr.
 import datetime
 import difflib
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -263,6 +264,46 @@ def _resolve(path: str) -> pathlib.Path:
     return p if p.is_absolute() else (WORKSPACE / p)
 
 
+def _memory_file_block_message(path: pathlib.Path) -> str | None:
+    """BLOCKED message if `path` is one of Jarvis's memory files, None
+    otherwise. Real incident, 2026-09-20: asked to double the swarm in the
+    orbit face, the model never looked at the face; it searched his notes,
+    found an old LESSONS.md entry, replaced the whole paragraph with the
+    text 'swarm scaling (double)' via edit_file, and reported the swarm
+    doubled. The vault isn't in git, so that write destroyed the entry
+    (restored from the backup mirror). Each memory file has its own
+    purpose-built tool (append_lesson, add_task/complete_task,
+    append_daily_note) that adds entries safely; the generic write/edit
+    tools have no business rewriting them. No confirmed=true override, same
+    reasoning as the shrink block: the model can set that flag itself, so it
+    can't be what protects a file. INDEX.md is deliberately NOT covered
+    here (it has no dedicated append tool, and Mark may want Jarvis able to
+    update it); widen this if that turns out to need the same protection."""
+    try:
+        resolved = os.path.normcase(str(path.resolve()))
+    except OSError:
+        return None
+    daily = os.path.normcase(str(DAILY_DIR.resolve())) + os.sep
+    if resolved == os.path.normcase(str(LESSONS_FILE.resolve())):
+        tool = "append_lesson"
+    elif resolved == os.path.normcase(str(TASKS_FILE.resolve())):
+        tool = "add_task / complete_task"
+    elif resolved.startswith(daily):
+        tool = "append_daily_note"
+    else:
+        return None
+    return (
+        f"BLOCKED: {path} is one of your own memory files. It is "
+        f"append-only through its own tool ({tool}); write_file and "
+        "edit_file can never change it, because a replace destroys "
+        "entries and the vault isn't in git. This block has NO "
+        "confirmed=true override. If an entry there is wrong and needs "
+        "removing or rewording, tell Mark and have Mary do it. If you "
+        "meant to change something else (a face, a config), you are "
+        "looking in the wrong place: read that file directly first."
+    )
+
+
 def read_file(args: dict) -> str:
     path = _resolve(args["path"])
     try:
@@ -324,6 +365,9 @@ def write_file(args: dict) -> str:
     path = _resolve(args["path"])
     content = args.get("content", "")
     confirmed = bool(args.get("confirmed", False))
+    memory_block = _memory_file_block_message(path)
+    if memory_block:
+        return memory_block
     if path.suffix in _SOURCE_CODE_SUFFIXES and not confirmed:
         return _source_edit_block_message(path, "write_file")
     shrink = _shrink_block_message(path, content)
@@ -751,6 +795,9 @@ def edit_file(args: dict) -> str:
     replace_all = bool(args.get("replace_all", False))
     confirmed = bool(args.get("confirmed", False))
 
+    memory_block = _memory_file_block_message(path)
+    if memory_block:
+        return memory_block
     if path.suffix in _SOURCE_CODE_SUFFIXES and not confirmed:
         return _source_edit_block_message(path, "edit_file")
 
