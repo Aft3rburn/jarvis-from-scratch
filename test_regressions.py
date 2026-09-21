@@ -729,5 +729,75 @@ class FaceLookClaimRegexTests(unittest.TestCase):
             self.assertFalse(agent._FACE_LOOK_CLAIM_RE.search(text), text)
 
 
+class RemoteGraniteRoutingTests(unittest.TestCase):
+    """2026-09-20: granite can be served from ADLAPTOP over the LAN
+    (JARVIS_REMOTE_GRANITE_URL), off by default, with a fallback to local
+    granite when the laptop isn't answering. Offline: _post_chat and the
+    reachability check are patched, nothing touches a network."""
+
+    REMOTE = "http://10.0.0.9:11434/api/chat"
+
+    def setUp(self):
+        agent._remote_dead_until = 0.0
+        agent._last_chat_target = None
+
+    def _run(self, remote=REMOTE, reachable=True, fail=(), **kw):
+        seen = []
+
+        def fake_post(url, data):
+            seen.append(url)
+            if url in fail:
+                if url == agent.OLLAMA_URL:
+                    raise agent.urllib.error.URLError("local down")
+                raise OSError("remote down")
+            return {"message": {"role": "assistant", "content": "ok"}}
+
+        with patch.object(agent, "REMOTE_GRANITE_URL", remote),                 patch.object(agent, "_remote_reachable", return_value=reachable),                 patch.object(agent, "_post_chat", side_effect=fake_post):
+            agent.call_ollama([{"role": "user", "content": "hi"}], **kw)
+        return seen
+
+    def test_off_by_default_uses_local(self):
+        self.assertEqual(self._run(remote=None), [agent.OLLAMA_URL])
+
+    def test_uses_remote_when_configured_and_reachable(self):
+        self.assertEqual(self._run(), [self.REMOTE])
+
+    def test_falls_back_to_local_when_unreachable(self):
+        self.assertEqual(self._run(reachable=False), [agent.OLLAMA_URL])
+
+    def test_falls_back_when_remote_request_fails_then_skips_it_for_a_while(self):
+        self.assertEqual(
+            self._run(fail=(self.REMOTE,)), [self.REMOTE, agent.OLLAMA_URL]
+        )
+        self.assertGreater(agent._remote_dead_until, agent.time.monotonic())
+        # Second call with the REAL reachability check: the recent failure
+        # short-circuits it, so the remote is never tried again this window.
+        seen = []
+        with patch.object(agent, "REMOTE_GRANITE_URL", self.REMOTE),                 patch.object(
+                    agent, "_post_chat",
+                    side_effect=lambda u, d: seen.append(u) or {"message": {}},
+                ):
+            agent.call_ollama([{"role": "user", "content": "hi"}])
+        self.assertEqual(seen, [agent.OLLAMA_URL])
+
+    def test_explicit_url_is_never_redirected(self):
+        seen = self._run(url=agent.FAST_OLLAMA_URL, model=agent.FAST_MODEL)
+        self.assertEqual(seen, [agent.FAST_OLLAMA_URL])
+
+    def test_other_models_are_never_redirected(self):
+        self.assertEqual(
+            self._run(model="qwen3-coder:30b"), [agent.OLLAMA_URL]
+        )
+
+    def test_local_failure_after_remote_fallback_still_raises_unavailable(self):
+        with self.assertRaises(agent.OllamaUnavailable):
+            self._run(fail=(self.REMOTE, agent.OLLAMA_URL))
+
+    def test_real_reachability_check_reports_false_and_marks_dead(self):
+        with patch.object(agent, "REMOTE_GRANITE_URL", "http://127.0.0.1:9/api/chat"),                 patch.object(agent, "REMOTE_CONNECT_TIMEOUT_S", 1):
+            self.assertFalse(agent._remote_reachable())
+        self.assertGreater(agent._remote_dead_until, agent.time.monotonic())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -20,6 +20,7 @@ bench alone, without paying for the full fabrication run too:
     python bench_granite4_tinyh.py fabrication
 """
 import json
+import os
 import subprocess
 import sys
 import time
@@ -34,7 +35,10 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 MODEL = "granite4:tiny-h"
 BASELINE = "qwen3-coder:30b"
-CHAT_URL = "http://localhost:11434/api/chat"
+# Point the bench at another machine's Ollama by setting BENCH_CHAT_URL, e.g.
+# "http://192.168.131.203:11434/api/chat" for ADLAPTOP's remote granite
+# (2026-09-20). Defaults to the local server, so existing runs are unchanged.
+CHAT_URL = os.environ.get("BENCH_CHAT_URL", "http://localhost:11434/api/chat")
 
 CODING_PROMPT = (
     "Write a documented Python function called second_largest_unique "
@@ -209,6 +213,10 @@ def call(model: str, prompt: str = None, timeout: int = 300, think: bool = None,
 
 
 def gpu_snapshot() -> str:
+    if "localhost" not in CHAT_URL and "127.0.0.1" not in CHAT_URL:
+        # `ollama ps` below only sees THIS machine, which isn't the one
+        # under test when the bench targets a remote Ollama.
+        return f"(remote target {CHAT_URL}: local `ollama ps` not applicable)"
     try:
         ps_out = subprocess.run(["ollama", "ps"], capture_output=True, text=True, timeout=10).stdout.strip()
     except Exception as e:

@@ -13,11 +13,15 @@ Usage:
 
 import http.server
 import json
+import os
 import pathlib
 import re
+import socket
 import sys
 import threading
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import bus
@@ -28,6 +32,24 @@ import voice
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL = "granite4:tiny-h"
 MAX_STEPS = 30
+
+# Remote granite, added 2026-09-20. qwen3-coder:30b (18GB) fills this
+# machine's 7900 XT, so granite can't stay resident beside it without a
+# reload on every model switch. ADLAPTOP (12GB VRAM, wired LAN, firewall
+# scoped to this machine's addresses only) serves granite4:tiny-h instead.
+# OFF by default: set JARVIS_REMOTE_GRANITE_URL to something like
+# "http://192.168.131.203:11434/api/chat" to turn it on. Only the default
+# full-lane granite call is redirected; explicit urls (the fast lane) and
+# any other model are untouched. If the remote can't be reached, calls fall
+# back to local granite, and the remote is skipped for
+# REMOTE_RETRY_AFTER_S seconds so a dead laptop doesn't add a connect
+# timeout to every step of every turn.
+REMOTE_GRANITE_URL = os.environ.get("JARVIS_REMOTE_GRANITE_URL") or None
+REMOTE_GRANITE_MODEL = "granite4:tiny-h"
+REMOTE_CONNECT_TIMEOUT_S = 2
+REMOTE_RETRY_AFTER_S = 60
+_remote_dead_until = 0.0
+_last_chat_target = None
 
 # Fast lane, item 3 of the 2026-09-10 four-part roadmap. A second Ollama
 # instance, pinned to the Nvidia RTX A1000 via OLLAMA_LLM_LIBRARY=cuda_v13
@@ -244,6 +266,38 @@ class OllamaUnavailable(Exception):
     plain message instead of a raw connection-refused traceback."""
 
 
+def _remote_reachable() -> bool:
+    """Quick TCP connect check against the remote granite host, so a
+    powered-off or unplugged laptop costs ~2 seconds once a minute instead
+    of a 180-second request timeout on every step. A recent failure short-
+    circuits without touching the network."""
+    if time.monotonic() < _remote_dead_until:
+        return False
+    parts = urllib.parse.urlsplit(REMOTE_GRANITE_URL)
+    try:
+        with socket.create_connection(
+            (parts.hostname, parts.port or 80), timeout=REMOTE_CONNECT_TIMEOUT_S
+        ):
+            return True
+    except OSError:
+        _mark_remote_dead()
+        return False
+
+
+def _mark_remote_dead() -> None:
+    global _remote_dead_until
+    _remote_dead_until = time.monotonic() + REMOTE_RETRY_AFTER_S
+
+
+def _note_chat_target(target: str) -> None:
+    """Print once whenever the chat target changes, so the log shows when a
+    turn moved to or away from the remote instead of staying silent."""
+    global _last_chat_target
+    if target != _last_chat_target:
+        print(f"\n[ollama] chat target: {target}")
+        _last_chat_target = target
+
+
 def call_ollama(
     messages: list,
     allowed_tools: set | None = None,
@@ -261,18 +315,41 @@ def call_ollama(
         "think": False,
     }
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"}
+    use_remote = (
+        REMOTE_GRANITE_URL is not None
+        and url == OLLAMA_URL
+        and model == REMOTE_GRANITE_MODEL
+        and _remote_reachable()
     )
+    if use_remote:
+        _note_chat_target(REMOTE_GRANITE_URL)
+        try:
+            return _post_chat(REMOTE_GRANITE_URL, data)
+        except OSError as e:
+            # URLError is an OSError; so are connection resets and read
+            # timeouts. Any of them means the remote isn't answering.
+            _mark_remote_dead()
+            print(
+                f"\n[ollama] remote granite failed ({e}); falling back to "
+                f"local for the next {REMOTE_RETRY_AFTER_S}s"
+            )
+    _note_chat_target(url)
     try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        return _post_chat(url, data)
     except urllib.error.URLError as e:
         raise OllamaUnavailable(
             f"Can't reach Ollama at {url} ({e.reason}). "
             "Is the Ollama server running? Try 'ollama serve' or check the "
             "Ollama Auto-Start scheduled task."
         ) from e
+
+
+def _post_chat(url: str, data: bytes) -> dict:
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
 
 def _give_up_answer(task_desc: str | None, tool_name: str | None) -> str:
