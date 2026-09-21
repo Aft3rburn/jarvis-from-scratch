@@ -152,6 +152,55 @@ _FACE_LOOK_CLAIM_RE = re.compile(
 )
 
 
+# General unbacked-change-claim guard, added 2026-09-20. Real incident:
+# asked to double the swarm in the orbit face, the model edited the wrong
+# file and answered "The swarm scaling parameter in the lessons has been
+# doubled" - a claim about a change that never happened to the thing asked
+# about. The face-look guard above never fired (no "face" in the sentence).
+# This one is deliberately general and deliberately narrow: only strong,
+# unambiguous change verbs in a first-person or "has been" claim, so an
+# ordinary answer that merely mentions an update ("the note was updated
+# yesterday") isn't caught. A claim of that shape with NO successful
+# state-changing tool call anywhere in the turn gets one forced retry, then
+# an honest replacement. Known limit, stated plainly: this does NOT catch a
+# successful edit of the WRONG target; it catches claims with nothing
+# real behind them at all. Memory files are separately made unwritable by
+# the generic tools (tools._memory_file_block_message).
+_CHANGE_VERBS = (
+    r"doubled|tripled|halved|increased|decreased|scaled|resized|edited"
+    r"|modified|rewritten|rewrote|replaced|removed|deleted|renamed|patched"
+)
+_CHANGE_CLAIM_RE = re.compile(
+    rf"\bI(?:'ve| have)?\s+(?:now\s+|successfully\s+|just\s+)*({_CHANGE_VERBS})\b"
+    rf"|\b(?:has|have)\s+(?:now\s+|successfully\s+|just\s+)*been\s+"
+    rf"(?:now\s+|successfully\s+)*({_CHANGE_VERBS})\b",
+    re.IGNORECASE,
+)
+_NEGATION_RE = re.compile(
+    r"\b(no|not|never|nothing|none|yet|unable|cannot|can't|couldn't|"
+    r"haven't|hasn't|didn't|isn't|wasn't|won't|wouldn't)\b|n't\b",
+    re.IGNORECASE,
+)
+
+
+def _is_change_claim(text: str) -> bool:
+    """True if `text` claims a change was made. A denial ("nothing has been
+    edited yet", "I haven't changed it") is honest, not a claim, so a
+    negation shortly before the verb clears it."""
+    for m in _CHANGE_CLAIM_RE.finditer(text):
+        window = text[max(0, m.start() - 30): m.end()]
+        if not _NEGATION_RE.search(window):
+            return True
+    return False
+
+
+_STATE_CHANGING_TOOLS = {
+    "write_file", "edit_file", "run_shell", "add_task", "complete_task",
+    "append_lesson", "append_daily_note", "schedule_task", "set_tone",
+    "set_face", "restart_hung_process", "relay_send", "run_subagent",
+}
+
+
 def _touches_face_file(path_str: str) -> bool:
     return bool(re.search(r"faces[\\/]", path_str, re.IGNORECASE))
 
@@ -463,6 +512,11 @@ def _agentic_turn(
     edited_face_file = False
     style_claim_retries = 0
     MAX_STYLE_CLAIM_RETRIES = 1
+    # 2026-09-20: any state-changing tool that actually succeeded this
+    # turn - see _CHANGE_CLAIM_RE.
+    made_real_change = False
+    change_claim_retries = 0
+    MAX_CHANGE_CLAIM_RETRIES = 1
 
     for step in range(1, MAX_STEPS + 1):
         print(f"\n--- step {step}: asking {model} ---")
@@ -634,6 +688,44 @@ def _agentic_turn(
             # having touched that face's file this turn gets one retry
             # with an explicit correction, then an honest replacement if
             # it still hasn't actually done it.
+            if _is_change_claim(answer) and not made_real_change:
+                if change_claim_retries < MAX_CHANGE_CLAIM_RETRIES and step < MAX_STEPS:
+                    change_claim_retries += 1
+                    print(
+                        "\n(final answer claims something was changed but "
+                        "no state-changing tool succeeded this turn - "
+                        f"forcing a retry, raw text: {answer!r})"
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "That's not true - you said you changed "
+                                "something, but no tool call this turn "
+                                "actually succeeded at changing anything. "
+                                "Do the real edit on the thing I actually "
+                                "asked about (read that exact file first), "
+                                "or say plainly that you haven't done it. "
+                                "Do not claim a change without one."
+                            ),
+                        }
+                    )
+                    continue
+                print(
+                    "\n(final answer still claims a change with nothing "
+                    f"real behind it after {MAX_CHANGE_CLAIM_RETRIES} "
+                    f"retry - replacing it instead of speaking it, it "
+                    f"was: {answer!r})"
+                )
+                answer = (
+                    "I said I changed something, but that wasn't true - "
+                    "nothing was actually changed. Tell me the exact file "
+                    "or thing you want changed and I'll read it first and "
+                    "then make the edit. Try asking me again."
+                )
+                messages[-1]["content"] = answer
+                had_malformed_attempt = True
+
             if _FACE_LOOK_CLAIM_RE.search(answer) and not edited_face_file:
                 if style_claim_retries < MAX_STYLE_CLAIM_RETRIES and step < MAX_STEPS:
                     style_claim_retries += 1
@@ -714,6 +806,15 @@ def _agentic_turn(
             print(f"tool result: {result[:500]}")
 
             messages.append({"role": "tool", "content": result, "name": name})
+
+            # Any state-changing tool that came back without an error or a
+            # block - see _CHANGE_CLAIM_RE above.
+            if (
+                name in _STATE_CHANGING_TOOLS
+                and isinstance(result, str)
+                and not result.startswith(("ERROR", "BLOCKED"))
+            ):
+                made_real_change = True
 
             # Tracks a real, successful edit to a face's own file this
             # turn - see _FACE_LOOK_CLAIM_RE above for why this matters.

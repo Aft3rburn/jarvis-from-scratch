@@ -872,5 +872,84 @@ class MemoryFileWriteBlockTests(unittest.TestCase):
             self.assertEqual(f.read_text(encoding="utf-8"), "yo")
 
 
+class UnbackedChangeClaimGuardTests(unittest.TestCase):
+    """2026-09-20: asked to double the orbit swarm, the model edited the
+    wrong file and answered 'The swarm scaling parameter in the lessons has
+    been doubled.' A claim of a change with no state-changing tool success
+    behind it gets one forced retry, then an honest replacement. Known
+    limit (not tested because it can't be caught): a successful edit of the
+    WRONG target still passes."""
+
+    CLAIM = "The swarm scaling parameter has been doubled."
+
+    def test_detector_flags_claims_and_clears_denials_and_plain_answers(self):
+        for text in (
+            self.CLAIM, "I've doubled the swarm.",
+            "I have successfully edited the file.",
+            "The file has now been replaced.", "I deleted the old entry.",
+        ):
+            self.assertTrue(agent._is_change_claim(text), text)
+        for text in (
+            "The lesson was updated yesterday.",
+            "Here are the faces currently available.",
+            "The circuit face has been activated.", "I'm ready to assist!",
+            "Your active face is aether2.",
+            "I can double it if you tell me which file.",
+            "The orbit face is now active.", "Nothing has been edited yet.",
+            "I haven't changed anything.", "The swarm has not been doubled.",
+            "It can't be doubled from here.",
+        ):
+            self.assertFalse(agent._is_change_claim(text), text)
+
+    def _run(self, script, registry):
+        scripted = _ScriptedOllama(script)
+        messages = [{"role": "user", "content": "double the swarm"}]
+        with patch.object(agent, "call_ollama", scripted), \
+             patch.dict(tools.REGISTRY, registry):
+            agent._agentic_turn(messages, speak_answer=False)
+        return messages[-1]["content"], scripted.calls
+
+    def test_claim_after_only_reading_is_retried_then_replaced(self):
+        final, calls = self._run(
+            [_real_tool_call_message("read_file", {"path": "x"}),
+             _plain_text_message(self.CLAIM),
+             _plain_text_message(self.CLAIM)],
+            {"read_file": lambda a: "some contents"},
+        )
+        self.assertNotIn("doubled", final)
+        self.assertIn("nothing was actually changed", final)
+        self.assertEqual(calls, 3)
+
+    def test_claim_after_a_failed_edit_is_still_caught(self):
+        final, calls = self._run(
+            [_real_tool_call_message("edit_file", {"path": "x"}),
+             _plain_text_message(self.CLAIM),
+             _plain_text_message(self.CLAIM)],
+            {"edit_file": lambda a: "ERROR: old_string not found in x"},
+        )
+        self.assertNotIn("doubled", final)
+        self.assertEqual(calls, 3)
+
+    def test_honest_correction_after_the_retry_passes_through(self):
+        honest = "I haven't changed anything yet. Which file do you mean?"
+        final, calls = self._run(
+            [_real_tool_call_message("read_file", {"path": "x"}),
+             _plain_text_message(self.CLAIM),
+             _plain_text_message(honest)],
+            {"read_file": lambda a: "some contents"},
+        )
+        self.assertEqual(final, honest)
+        self.assertEqual(calls, 3)
+
+    def test_claim_backed_by_a_successful_change_is_untouched(self):
+        final, calls = self._run(
+            [_real_tool_call_message("edit_file", {"path": "x"}),
+             _plain_text_message(self.CLAIM)],
+            {"edit_file": lambda a: "OK: replaced 1 occurrence(s) in x"},
+        )
+        self.assertEqual(final, self.CLAIM)
+        self.assertEqual(calls, 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
