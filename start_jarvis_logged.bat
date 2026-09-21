@@ -10,6 +10,10 @@ rem ============================================================
 
 cd /d "%~dp0"
 
+rem  Remote granite (2026-09-20): granite runs on ADLAPTOP over the LAN, with an automatic
+rem  fallback to local granite if the laptop is unreachable. Remove the next line to go fully local.
+set JARVIS_REMOTE_GRANITE_URL=http://192.168.131.203:11434/api/chat
+
 echo [Jarvis] Stopping any existing Jarvis voice instances...
 powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*jarvis-from-scratch*agent.py*' } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch {} }"
 powershell -NoProfile -Command "Start-Sleep -Seconds 3"
