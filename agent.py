@@ -46,6 +46,15 @@ MAX_STEPS = 30
 # timeout to every step of every turn.
 REMOTE_GRANITE_URL = os.environ.get("JARVIS_REMOTE_GRANITE_URL") or None
 REMOTE_GRANITE_MODEL = "granite4:tiny-h"
+# Context window requested on remote calls. Real incident, 2026-09-20: the
+# first live run through ADLAPTOP made Jarvis useless, because that Ollama
+# defaulted to a 4096-token context on its 12GB card while his system
+# prompt plus tool schemas run ~10-12k tokens. Ollama silently keeps only
+# the tail of an oversized prompt, so the model never saw its instructions
+# (probe: 2050 of ~9700 prompt tokens evaluated, empty reply; the local
+# 32768 default evaluated all of it). Sent per request so it holds
+# whatever the remote server's own default is.
+REMOTE_NUM_CTX = 32768
 REMOTE_CONNECT_TIMEOUT_S = 2
 REMOTE_RETRY_AFTER_S = 60
 _remote_dead_until = 0.0
@@ -323,8 +332,11 @@ def call_ollama(
     )
     if use_remote:
         _note_chat_target(REMOTE_GRANITE_URL)
+        remote_payload = dict(payload, options={"num_ctx": REMOTE_NUM_CTX})
         try:
-            return _post_chat(REMOTE_GRANITE_URL, data)
+            return _post_chat(
+                REMOTE_GRANITE_URL, json.dumps(remote_payload).encode("utf-8")
+            )
         except OSError as e:
             # URLError is an OSError; so are connection resets and read
             # timeouts. Any of them means the remote isn't answering.

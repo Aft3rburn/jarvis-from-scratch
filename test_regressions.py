@@ -22,6 +22,7 @@ Session 37 proof scripts this suite makes permanent.
 
 import ast
 import inspect
+import json
 import unittest
 from unittest.mock import patch
 
@@ -755,6 +756,25 @@ class RemoteGraniteRoutingTests(unittest.TestCase):
         with patch.object(agent, "REMOTE_GRANITE_URL", remote),                 patch.object(agent, "_remote_reachable", return_value=reachable),                 patch.object(agent, "_post_chat", side_effect=fake_post):
             agent.call_ollama([{"role": "user", "content": "hi"}], **kw)
         return seen
+
+    def test_remote_payload_asks_for_the_big_context_and_local_does_not(self):
+        bodies = {}
+
+        def fake_post(url, data):
+            bodies[url] = json.loads(data.decode("utf-8"))
+            return {"message": {"role": "assistant", "content": "ok"}}
+
+        with patch.object(agent, "REMOTE_GRANITE_URL", self.REMOTE),                 patch.object(agent, "_remote_reachable", return_value=True),                 patch.object(agent, "_post_chat", side_effect=fake_post):
+            agent.call_ollama([{"role": "user", "content": "hi"}])
+        self.assertEqual(
+            bodies[self.REMOTE]["options"], {"num_ctx": agent.REMOTE_NUM_CTX}
+        )
+        self.assertGreaterEqual(agent.REMOTE_NUM_CTX, 16384)
+
+        bodies.clear()
+        with patch.object(agent, "REMOTE_GRANITE_URL", None),                 patch.object(agent, "_post_chat", side_effect=fake_post):
+            agent.call_ollama([{"role": "user", "content": "hi"}])
+        self.assertNotIn("options", bodies[agent.OLLAMA_URL])
 
     def test_off_by_default_uses_local(self):
         self.assertEqual(self._run(remote=None), [agent.OLLAMA_URL])
