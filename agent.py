@@ -169,6 +169,7 @@ _FACE_LOOK_CLAIM_RE = re.compile(
 _CHANGE_VERBS = (
     r"doubled|tripled|halved|increased|decreased|scaled|resized|edited"
     r"|modified|rewritten|rewrote|replaced|removed|deleted|renamed|patched"
+    r"|adjusted|changed|updated|applied|made"
 )
 _CHANGE_CLAIM_RE = re.compile(
     rf"\bI(?:'ve| have)?\s+(?:now\s+|successfully\s+|just\s+)*({_CHANGE_VERBS})\b"
@@ -198,6 +199,7 @@ _STATE_CHANGING_TOOLS = {
     "write_file", "edit_file", "run_shell", "add_task", "complete_task",
     "append_lesson", "append_daily_note", "schedule_task", "set_tone",
     "set_face", "restart_hung_process", "relay_send", "run_subagent",
+    "set_face_tunable",
 }
 
 
@@ -472,6 +474,16 @@ def _agentic_turn(
     exactly once, after deciding whether to escalate, instead of the
     turn speaking a give-up message that escalation then talks over."""
     bus.set_state("thinking")
+
+    # Mark's actual sentence for this turn, handed to the face tunables
+    # tools so a model's drifting arguments (wrong face from an old turn,
+    # wrong value, wrong multiplier) get checked against what he said.
+    turn_id = str(time.time_ns())
+    request_text = ""
+    for _m in reversed(messages):
+        if _m.get("role") == "user" and isinstance(_m.get("content"), str):
+            request_text = _m["content"]
+            break
 
     # Tracks a malformed (plain-text) tool call happening earlier this
     # turn, so a follow-up plain-text "answer" right after one doesn't get
@@ -794,6 +806,19 @@ def _agentic_turn(
             # some models emit a JSON string - handle both.
             args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
 
+            # Live dry-run, 2026-09-20: granite kept calling the read-only
+            # face_tunables with the SET tool's arguments (a value like
+            # 'double') and then stopped, treating a listing as the change.
+            # A value can only mean the set was intended, so treat it as one.
+            if (
+                name == "face_tunables"
+                and isinstance(args, dict)
+                and args.get("value") not in (None, "")
+                and (allowed_tools is None or "set_face_tunable" in allowed_tools)
+            ):
+                print("(face_tunables was called with a value - treating it as set_face_tunable)")
+                name = "set_face_tunable"
+
             print(f"tool call: {name}({args})")
             if allowed_tools is not None and name not in allowed_tools:
                 result = f"ERROR: tool '{name}' is not permitted for this task."
@@ -802,6 +827,8 @@ def _agentic_turn(
                 if handler is None:
                     result = f"ERROR: no such tool: {name}"
                 else:
+                    if name in ("face_tunables", "set_face_tunable"):
+                        args = dict(args or {}, _request=request_text, _turn=turn_id)
                     result = handler(args)
             print(f"tool result: {result[:500]}")
 
@@ -823,6 +850,14 @@ def _agentic_turn(
                 and isinstance(result, str)
                 and result.startswith("OK")
                 and _touches_face_file(str(args.get("path", "")))
+            ):
+                edited_face_file = True
+            # set_face_tunable is a real, verified edit of a face's own
+            # file (added 2026-09-20).
+            if (
+                name == "set_face_tunable"
+                and isinstance(result, str)
+                and result.startswith("OK")
             ):
                 edited_face_file = True
 

@@ -887,6 +887,9 @@ class UnbackedChangeClaimGuardTests(unittest.TestCase):
             self.CLAIM, "I've doubled the swarm.",
             "I have successfully edited the file.",
             "The file has now been replaced.", "I deleted the old entry.",
+            "I've adjusted the swarm objects by doubling their count.",
+            "The change has been made - refresh the face.",
+            "The orbit face has been updated.",
         ):
             self.assertTrue(agent._is_change_claim(text), text)
         for text in (
@@ -949,6 +952,205 @@ class UnbackedChangeClaimGuardTests(unittest.TestCase):
         )
         self.assertEqual(final, self.CLAIM)
         self.assertEqual(calls, 2)
+
+
+class FaceTunablesTests(unittest.TestCase):
+    """2026-09-20: neither granite (0/8) nor qwen3-coder:30b (0/4) could
+    'double the swarm objects' on the orbit face by hunting through its
+    HTML, so face_tunables / set_face_tunable do the grounding in code.
+    Every test runs against a scratch copy of the visualizer folder."""
+
+    FACE_HTML = (
+        "<style>\n:root{\n  --ink:#eaf3f6; --cool:#43a9d0;\n}\n</style>\n"
+        "<script>\n"
+        "const SQUASH=.32;   // shared vertical-axis squash\n"
+        "/* ---------------- ambient swarm: fixed at load ---------------- */\n"
+        "const AMB_N=14;\n"
+        "const TASKLOG_MAX=40;\n"
+        "</script>\n"
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = pathlib.Path(self.tmp.name)
+        for name in ("orbit", "aether"):
+            (root / "faces" / name).mkdir(parents=True)
+            (root / "faces" / name / "index.html").write_text(self.FACE_HTML, encoding="utf-8")
+        (root / "ai-visualizer.json").write_text('{"face": "orbit"}', encoding="utf-8")
+        self.root = root
+        self.patches = [
+            patch.object(tools, "VISUALIZER_DIR", root),
+            patch.object(tools, "VISUALIZER_CONFIG_PATH", root / "ai-visualizer.json"),
+        ]
+        for pt in self.patches:
+            pt.start()
+
+    def tearDown(self):
+        for pt in self.patches:
+            pt.stop()
+        self.tmp.cleanup()
+
+    def _html(self, face="orbit"):
+        return (self.root / "faces" / face / "index.html").read_bytes().decode("utf-8")
+
+    def test_lists_values_with_plain_descriptions_for_the_active_face(self):
+        out = tools.face_tunables({})
+        self.assertIn("AMB_N = 14", out)
+        self.assertIn("ambient swarm", out)
+        self.assertIn("SQUASH = .32", out)
+        self.assertIn("--cool = #43a9d0", out)
+
+    def test_parses_the_real_orbit_face_and_finds_the_swarm(self):
+        real = pathlib.Path(__file__).parent / "visualizer" / "faces" / "orbit" / "index.html"
+        if not real.exists():
+            self.skipTest("no real orbit face on this machine")
+        items = {i["name"]: i for i in tools._parse_tunables(real.read_text(encoding="utf-8"))}
+        self.assertIn("AMB_N", items)
+        self.assertIn("swarm", items["AMB_N"]["desc"].lower())
+
+    def test_doubling_the_swarm_changes_only_that_value(self):
+        before = self._html()
+        result = tools.set_face_tunable({"name": "AMB_N", "value": "28"})
+        self.assertTrue(result.startswith("OK:"), result)
+        after = self._html()
+        self.assertEqual(after, before.replace("const AMB_N=14;", "const AMB_N=28;"))
+        self.assertEqual(self._html("aether"), before, "other faces must be untouched")
+
+    def test_line_endings_are_preserved(self):
+        crlf_html = self.FACE_HTML.replace("\n", "\r\n")
+        (self.root / "faces" / "orbit" / "index.html").write_bytes(crlf_html.encode("utf-8"))
+        tools.set_face_tunable({"name": "AMB_N", "value": "28"})
+        raw = (self.root / "faces" / "orbit" / "index.html").read_bytes()
+        self.assertEqual(raw.count(b"\r\n"), crlf_html.count("\r\n"))
+        self.assertEqual(raw.count(b"\n"), raw.count(b"\r\n"))
+
+    def test_absurd_and_bad_values_are_rejected_and_nothing_changes(self):
+        before = self._html()
+        for bad in ("100000", "-5", "lots", "nan", "inf"):
+            result = tools.set_face_tunable({"name": "AMB_N", "value": bad})
+            self.assertTrue(result.startswith("ERROR"), (bad, result))
+        self.assertEqual(self._html(), before)
+
+    def test_colors_take_hex_only(self):
+        ok = tools.set_face_tunable({"name": "--cool", "value": "#0000ff"})
+        self.assertTrue(ok.startswith("OK:"), ok)
+        self.assertIn("--cool:#0000ff", self._html())
+        before = self._html()
+        self.assertTrue(tools.set_face_tunable({"name": "cool", "value": "blue"}).startswith("ERROR"))
+        self.assertEqual(self._html(), before)
+
+    def test_exact_names_are_forgiving_about_case_and_dashes(self):
+        self.assertTrue(tools.set_face_tunable({"name": "amb_n", "value": "20"}).startswith("OK:"))
+        self.assertTrue(tools.set_face_tunable({"name": "cool", "value": "#111111"}).startswith("OK:"))
+
+    def test_mark_s_own_words_find_the_right_value_by_description(self):
+        for phrase in ("swarm objects", "swarm_count", "swarmObjectsCount", "the swarm"):
+            (self.root / "faces" / "orbit" / "index.html").write_text(self.FACE_HTML, encoding="utf-8")
+            result = tools.set_face_tunable({"what": phrase, "value": "double"})
+            self.assertTrue(result.startswith("OK:"), (phrase, result))
+            self.assertIn("AMB_N 14 -> 28", result)
+            self.assertIn("const AMB_N=28;", self._html())
+            self.assertIn("const SQUASH=.32;", self._html(), "must not touch the wrong value")
+
+    def test_the_request_overrides_a_model_pick_that_ignores_what_mark_said(self):
+        # the model grabbed SQUASH, but Mark said 'swarm'
+        result = tools.set_face_tunable({
+            "what": "SQUASH", "value": "double",
+            "_request": "make an edit to this space and double the swarm objects",
+        })
+        self.assertTrue(result.startswith("OK:"), result)
+        self.assertIn("AMB_N 14 -> 28", result)
+        self.assertIn("const SQUASH=.32;", self._html())
+
+    def test_a_model_pick_that_matches_the_request_is_kept(self):
+        result = tools.set_face_tunable({
+            "what": "AMB_N", "value": "double",
+            "_request": "double the swarm",
+        })
+        self.assertIn("AMB_N 14 -> 28", result)
+        self.assertNotIn("[used", result)
+
+    def test_a_scale_word_in_the_request_beats_a_wrong_multiplier(self):
+        result = tools.set_face_tunable({
+            "what": "swarm", "value": "x3", "_request": "double the swarm objects",
+        })
+        self.assertIn("AMB_N 14 -> 28", result)
+        (self.root / "faces" / "orbit" / "index.html").write_text(self.FACE_HTML, encoding="utf-8")
+        result = tools.set_face_tunable({
+            "what": "swarm", "value": "20", "_request": "double the swarm objects",
+        })
+        self.assertIn("AMB_N 14 -> 28", result)
+
+    def test_an_explicit_number_in_the_request_is_respected(self):
+        result = tools.set_face_tunable({
+            "what": "swarm", "value": "40", "_request": "set the swarm to 40",
+        })
+        self.assertIn("AMB_N 14 -> 40", result)
+
+    def test_a_face_mark_never_named_is_replaced_by_the_active_face(self):
+        before_aether = self._html("aether")
+        result = tools.set_face_tunable({
+            "face": "aether", "what": "swarm", "value": "double",
+            "_request": "double the swarm objects",
+        })
+        self.assertTrue(result.startswith("OK:"), result)
+        self.assertEqual(self._html("aether"), before_aether)
+        self.assertIn("const AMB_N=28;", self._html("orbit"))
+
+    def test_a_face_mark_did_name_is_used(self):
+        result = tools.set_face_tunable({
+            "face": "aether", "what": "swarm", "value": "double",
+            "_request": "double the swarm on the aether face",
+        })
+        self.assertIn("const AMB_N=28;", self._html("aether"))
+        self.assertIn("aether", result)
+
+    def test_a_request_that_matches_nothing_refuses_instead_of_guessing(self):
+        before = self._html()
+        result = tools.set_face_tunable({
+            "what": "AMB_N", "value": "40",
+            "_request": "make the rainbow louder",
+        })
+        self.assertTrue(result.startswith("ERROR"), result)
+        self.assertEqual(self._html(), before)
+
+    def test_a_repeat_call_in_the_same_turn_does_not_compound(self):
+        first = tools.set_face_tunable({"what": "swarm", "value": "double", "_turn": "t1"})
+        self.assertIn("AMB_N 14 -> 28", first)
+        again = tools.set_face_tunable({"what": "swarm", "value": "double", "_turn": "t1"})
+        self.assertTrue(again.startswith("ALREADY DONE"), again)
+        self.assertIn("const AMB_N=28;", self._html())
+        # a new turn may change it again
+        later = tools.set_face_tunable({"what": "swarm", "value": "double", "_turn": "t2"})
+        self.assertIn("AMB_N 28 -> 56", later)
+
+    def test_a_phrase_that_matches_nothing_lists_candidates_and_changes_nothing(self):
+        before = self._html()
+        result = tools.set_face_tunable({"what": "speed", "value": "2"})
+        self.assertTrue(result.startswith("ERROR"), result)
+        self.assertIn("AMB_N", result)
+        self.assertEqual(self._html(), before)
+
+    def test_scale_words_use_the_current_value(self):
+        for raw, expected in (("double", "28"), ("x3", "42"), ("3x", "42"), ("half", "7"), ("20", "20")):
+            (self.root / "faces" / "orbit" / "index.html").write_text(self.FACE_HTML, encoding="utf-8")
+            result = tools.set_face_tunable({"what": "swarm", "value": raw})
+            self.assertTrue(result.startswith("OK:"), (raw, result))
+            self.assertIn(f"const AMB_N={expected};", self._html(), raw)
+
+    def test_near_miss_face_name_gets_a_suggestion_not_a_guess(self):
+        before = self._html("aether")
+        result = tools.set_face_tunable({"face": "aeter", "name": "AMB_N", "value": "28"})
+        self.assertTrue(result.startswith("ERROR"), result)
+        self.assertIn("aether", result)
+        self.assertEqual(self._html("aether"), before)
+
+    def test_registered_and_counted_as_a_real_change_by_the_claim_guards(self):
+        self.assertIn("face_tunables", tools.REGISTRY)
+        self.assertIn("set_face_tunable", tools.REGISTRY)
+        names = {s["function"]["name"] for s in tools.SCHEMAS}
+        self.assertLessEqual({"face_tunables", "set_face_tunable"}, names)
+        self.assertIn("set_face_tunable", agent._STATE_CHANGING_TOOLS)
 
 
 if __name__ == "__main__":

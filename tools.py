@@ -1374,6 +1374,360 @@ def recent_daily_notes(max_chars: int = 2000) -> str:
 
 
 # Name -> callable, used by the agent loop to dispatch a tool call.
+# --- Face tunables, added 2026-09-20 ---
+#
+# Why this exists: Mark asked Jarvis to "double the swarm objects" on the
+# orbit face. A dry-run against granite (0/8) and qwen3-coder:30b (0/4)
+# showed neither model ever does the grounding steps a person would (find
+# the active face, find the term inside that face's file, read the
+# constant, edit it): they wrote files at invented paths, edited the wrong
+# face, or gave up. Prompt guidance never held on this model, so the search
+# lives in code: face_tunables shows what a face lets you adjust with plain
+# descriptions taken from the face's own comments, and set_face_tunable
+# changes one value, validated, and verifies it landed.
+#
+# What counts as tunable, by convention already used across the faces: a
+# top-level `const NAME = <number>;` with an ALL-CAPS name, and the color
+# custom properties in the first `:root{...}` block.
+_TUNABLE_NUM_RE = re.compile(
+    r"^([ \t]{0,2})const[ \t]+([A-Z][A-Z0-9_]*)[ \t]*=[ \t]*(-?\d*\.?\d+)[ \t]*;", re.M
+)
+_TUNABLE_COLOR_RE = re.compile(r"(--[a-z][a-z0-9-]*)[ \t]*:[ \t]*(#[0-9a-fA-F]{3,8})\b")
+_HEX_COLOR_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
+
+
+def _tidy_comment(line: str) -> str:
+    line = line.strip()
+    line = re.sub(r"^(/\*+|//+)", "", line)
+    line = re.sub(r"\*+/$", "", line)
+    line = re.sub(r"^[-=*\s]+|[-=*\s]+$", "", line)
+    return line.strip()
+
+
+def _tunable_description(text: str, match_start: int, match_end: int) -> str:
+    """Plain-language description for a numeric constant: its own trailing
+    comment if it has one, else the nearest comment line just above it."""
+    line_end = text.find("\n", match_end)
+    line_end = len(text) if line_end == -1 else line_end
+    trailing = text[match_end:line_end]
+    m = re.search(r"//\s*(.+)$|/\*\s*(.+?)\s*\*/", trailing)
+    if m:
+        return (m.group(1) or m.group(2)).strip()[:140]
+    above = text[:match_start].split("\n")[-6:-1]
+    for raw in reversed(above):
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(("//", "/*", "*")) or stripped.endswith("*/"):
+            cleaned = _tidy_comment(stripped)
+            if cleaned:
+                return cleaned[:140]
+        break
+    return ""
+
+
+def _parse_tunables(text: str) -> list[dict]:
+    """Every adjustable value in a face's index.html: {name, kind, value,
+    line, span, desc}. `span` is the exact (start, end) of the value in
+    `text`, so a change touches nothing else."""
+    found = []
+    for m in _TUNABLE_NUM_RE.finditer(text):
+        found.append({
+            "name": m.group(2), "kind": "number", "value": m.group(3),
+            "line": text.count("\n", 0, m.start()) + 1, "span": m.span(3),
+            "desc": _tunable_description(text, m.start(), m.end()),
+        })
+    root = re.search(r":root\s*\{(.*?)\}", text, re.S)
+    if root:
+        for m in _TUNABLE_COLOR_RE.finditer(root.group(1)):
+            start = root.start(1) + m.start(2)
+            found.append({
+                "name": m.group(1), "kind": "color", "value": m.group(2),
+                "line": text.count("\n", 0, start) + 1,
+                "span": (start, root.start(1) + m.end(2)),
+                "desc": "color (CSS custom property)",
+            })
+    return found
+
+
+def _active_face_name() -> str:
+    try:
+        return json.loads(VISUALIZER_CONFIG_PATH.read_text(encoding="utf-8")).get("face", "") or ""
+    except (OSError, json.JSONDecodeError):
+        return ""
+
+
+def _face_names() -> list[str]:
+    faces_dir = VISUALIZER_DIR / "faces"
+    if not faces_dir.is_dir():
+        return []
+    return sorted(p.name for p in faces_dir.iterdir() if p.is_dir() and (p / "index.html").exists())
+
+
+def _resolve_face_for_tunables(face: str | None, request: str = "") -> tuple[str | None, str | None]:
+    """(face_name, error). No name given means the active face, so 'this
+    face' / 'this space' work. A near-miss name (a speech-recognition slip
+    like 'acer' for 'aether') gets a suggestion instead of a guess."""
+    names = _face_names()
+    name = (face or "").strip() or _active_face_name()
+    if request and face and name in names and name != _active_face_name():
+        spoken = name.lower().replace("_", " ").replace("-", " ")
+        if spoken not in request.lower().replace("_", " ").replace("-", " "):
+            # Mark never named that face; models pick one up from earlier
+            # turns in the history. 'this face' means the active one.
+            name = _active_face_name() or name
+    if not name:
+        return None, "ERROR: no face named and no active face is set. Call list_faces."
+    if name in names:
+        return name, None
+    close = difflib.get_close_matches(name, names, n=2, cutoff=0.5)
+    hint = f" Did you mean {' or '.join(repr(c) for c in close)}?" if close else ""
+    return None, f"ERROR: no face named {name!r}.{hint} Available faces: {', '.join(names)}."
+
+
+def face_tunables(args: dict | None = None) -> str:
+    args = args or {}
+    name, err = _resolve_face_for_tunables(args.get("face"), str(args.get("_request") or ""))
+    if err:
+        return err
+    path = VISUALIZER_DIR / "faces" / name / "index.html"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        return f"ERROR reading {path}: {e}"
+    items = _parse_tunables(text)
+    if not items:
+        return (
+            f"The {name!r} face has no tunable values (no ALL-CAPS numeric "
+            "constants or :root color variables). Adjusting it would mean "
+            "editing its index.html by hand; tell Mark instead of guessing."
+        )
+    lines = [f"Tunable values in the {name!r} face (visualizer/faces/{name}/index.html):"]
+    for it in items:
+        desc = f"  - {it['desc']}" if it["desc"] else ""
+        lines.append(f"  {it['name']} = {it['value']}{desc}")
+    lines.append(
+        "Change one with set_face_tunable(name, value). The page reads these "
+        "when it loads, so Mark has to refresh the face to see a change."
+    )
+    return "\n".join(lines)
+
+
+def _format_number(new: float, old_text: str) -> str:
+    if "." not in old_text and float(new).is_integer():
+        return str(int(new))
+    return f"{new:.6f}".rstrip("0").rstrip(".") or "0"
+
+
+# One change per value per turn. Live dry-run, 2026-09-20: granite called
+# set_face_tunable up to eight times in one turn, and each 'double' compounded
+# (14 -> 28 -> ... -> 1792). The agent hands each turn a unique id; a second
+# change to the same value within the same turn is refused.
+_TUNABLE_DONE: dict = {"turn": None, "done": {}}
+
+
+_TUNABLE_STOPWORDS = {
+    "the", "a", "an", "of", "to", "its", "this", "that", "in", "on", "for",
+    "objects", "object", "things", "thing", "items", "item", "count",
+    "number", "amount", "value", "level", "setting", "face", "space",
+}
+_SCALE_WORDS = {"double": 2.0, "twice": 2.0, "triple": 3.0, "quadruple": 4.0,
+                "half": 0.5, "halve": 0.5}
+
+
+def _split_words(text: str) -> list[str]:
+    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+    return [w for w in re.split(r"[^A-Za-z0-9]+", text.lower()) if w]
+
+
+def _stem(word: str) -> str:
+    return word[:-1] if len(word) > 3 and word.endswith("s") else word
+
+
+# Words in Mark's sentence that say nothing about WHICH value he means.
+_REQUEST_FILLER = _TUNABLE_STOPWORDS | {
+    "make", "edit", "change", "set", "please", "would", "like", "you", "i",
+    "me", "my", "want", "wanna", "can", "could", "it", "up", "down", "more",
+    "less", "bigger", "smaller", "some", "just", "okay", "ok", "hey",
+    "jarvis", "and", "also", "then", "now", "by", "with", "from", "is",
+    "are", "be", "need", "adjust", "increase", "decrease", "raise", "lower",
+    "turn", "put", "get", "give", "do", "double", "twice", "triple", "half",
+    "quadruple", "halve", "was", "just", "so", "what", "how", "about",
+}
+
+
+def _request_tokens(request: str) -> set[str]:
+    return {_stem(w) for w in _split_words(request)
+            if w not in _REQUEST_FILLER and not w.isdigit()}
+
+
+def _request_scale(request: str) -> float | None:
+    """A scale word in Mark's own sentence ('double') and no explicit
+    number: the factor he asked for. Returns None otherwise."""
+    if re.search(r"\d", request):
+        return None
+    for w in _split_words(request):
+        if w in _SCALE_WORDS:
+            return _SCALE_WORDS[w]
+    return None
+
+
+def _item_overlap(item: dict, tokens: set[str]) -> int:
+    name_words = {_stem(w) for w in _split_words(item["name"])}
+    desc_words = {_stem(w) for w in _split_words(item["desc"])}
+    return 2 * len(tokens & name_words) + len(tokens & desc_words)
+
+
+def _match_tunable(items: list[dict], phrase: str) -> tuple[dict | None, str | None]:
+    """Resolve what Mark said ('swarm objects') or an exact name to one
+    tunable. Exact name first; otherwise score the phrase's meaningful words
+    against each tunable's name and description. Only a unique best match is
+    accepted: a tie or nothing gets an error that lists the candidates with
+    their descriptions, so a wrong guess never silently edits the wrong
+    thing (a model picking SQUASH for 'swarm' is exactly what this exists
+    to stop)."""
+    exact = [i for i in items if i["name"] == phrase or i["name"] == "--" + phrase
+             or i["name"].lower() == phrase.lower()]
+    if len(exact) == 1:
+        return exact[0], None
+    tokens = [_stem(w) for w in _split_words(phrase) if w not in _TUNABLE_STOPWORDS]
+    scored = []
+    for it in items:
+        name_words = {_stem(w) for w in _split_words(it["name"])}
+        desc_words = {_stem(w) for w in _split_words(it["desc"])}
+        score = sum(2 for t in tokens if t in name_words) + sum(1 for t in tokens if t in desc_words)
+        if score:
+            scored.append((score, it))
+    if scored:
+        scored.sort(key=lambda x: -x[0])
+        if len(scored) == 1 or scored[0][0] > scored[1][0]:
+            return scored[0][1], None
+        cands = [it for sc, it in scored if sc == scored[0][0]]
+    else:
+        cands = items
+    listing = "; ".join(
+        f"{it['name']} = {it['value']}" + (f" ({it['desc']})" if it["desc"] else "")
+        for it in cands[:8]
+    )
+    return None, (
+        f"ERROR: could not tell which value {phrase!r} means. Candidates: {listing}. "
+        "Nothing changed. Ask Mark which one, or pick from these."
+    )
+
+
+def _resolve_new_number(raw_value: str, old_text: str) -> tuple[float | None, str | None]:
+    """A plain number is the new absolute value. 'double', 'half', 'x3',
+    '3x' scale the CURRENT value, so the model never has to do arithmetic."""
+    v = raw_value.strip().lower()
+    old = float(old_text)
+    if v in _SCALE_WORDS:
+        return old * _SCALE_WORDS[v], None
+    m = re.fullmatch(r"(?:[x\u00d7*]\s*(\d*\.?\d+)|(\d*\.?\d+)\s*[x\u00d7])", v)
+    if m:
+        return old * float(m.group(1) or m.group(2)), None
+    try:
+        return float(v), None
+    except ValueError:
+        return None, f"ERROR: {raw_value!r} is not a number, or double/half/x3. Nothing changed."
+
+
+def set_face_tunable(args: dict) -> str:
+    request = str(args.get("_request") or "")
+    name, err = _resolve_face_for_tunables(args.get("face"), request)
+    if err:
+        return err
+    phrase = str(args.get("what") or args.get("name") or "").strip()
+    raw_value = str(args.get("value", "")).strip()
+    if not phrase or raw_value == "":
+        return "ERROR: say what to change (what) and the new value. Call face_tunables to see the real options."
+    path = VISUALIZER_DIR / "faces" / name / "index.html"
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            text = f.read()
+    except OSError as e:
+        return f"ERROR reading {path}: {e}"
+    items = _parse_tunables(text)
+    if not items:
+        return face_tunables({"face": name})
+    item, why = _match_tunable(items, phrase)
+    notes = ""
+    if request:
+        rt = _request_tokens(request)
+        if rt:
+            ranked = sorted(((_item_overlap(it, rt), it) for it in items), key=lambda x: -x[0])
+            top = ranked[0][0]
+            unique_top = top > 0 and (len(ranked) == 1 or ranked[1][0] < top)
+            if item is None or _item_overlap(item, rt) == 0:
+                # The model's pick has nothing to do with what Mark said:
+                # use the one value his own words point at, or refuse.
+                if unique_top:
+                    item = ranked[0][1]
+                    notes = f" [used {item['name']}, the value your words point at]"
+                else:
+                    cands = "; ".join(f"{it['name']} = {it['value']}" for sc, it in ranked[:6])
+                    return (
+                        f"ERROR: nothing here clearly matches what Mark said ({request.strip()[:80]!r}). "
+                        f"Options: {cands}. Nothing changed. Ask Mark which one he means."
+                    )
+    if item is None:
+        return why
+    if item["kind"] == "color":
+        if not _HEX_COLOR_RE.match(raw_value):
+            return f"ERROR: {raw_value!r} is not a hex color like #0000ff. Nothing changed."
+        new_text_value = raw_value
+    else:
+        new, bad = _resolve_new_number(raw_value, item["value"])
+        if bad:
+            return bad
+        scale = _request_scale(request) if request else None
+        if scale is not None and abs(new - float(item["value"]) * scale) > 1e-9:
+            new = float(item["value"]) * scale
+            notes += f" [value set to x{scale:g} of the current one, as Mark asked]"
+        old = float(item["value"])
+        limit = max(50 * abs(old), 100)
+        if not (new == new) or new in (float("inf"), float("-inf")) or new < 0 or new > limit:
+            return (
+                f"ERROR: {raw_value} is outside the sane range for {item['name']} "
+                f"(0 to {limit:g}, current {item['value']}). Nothing changed."
+            )
+        new_text_value = _format_number(new, item["value"])
+    turn = str(args.get("_turn") or "")
+    if turn:
+        if _TUNABLE_DONE["turn"] != turn:
+            _TUNABLE_DONE["turn"] = turn
+            _TUNABLE_DONE["done"] = {}
+        prev = _TUNABLE_DONE["done"].get((name, item["name"]))
+        if prev:
+            return (
+                f"ALREADY DONE this turn: {name} {item['name']} was changed "
+                f"{prev[0]} -> {prev[1]}. Not changing it again. It is finished: "
+                "tell Mark it's done and to refresh the face."
+            )
+    start, end = item["span"]
+    new_text = text[:start] + new_text_value + text[end:]
+    try:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(new_text)
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            check = f.read()
+    except OSError as e:
+        return f"ERROR writing {path}: {e}"
+    after = [i for i in _parse_tunables(check) if i["name"] == item["name"]]
+    if len(after) != 1 or after[0]["value"] != new_text_value:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        return f"ERROR: the change to {item['name']} did not verify after writing, so it was rolled back. Nothing changed."
+    if turn:
+        _TUNABLE_DONE["done"][(name, item["name"])] = (item["value"], new_text_value)
+    matched = f" (matched {phrase!r} to {item['name']}" + (f": {item['desc']})" if item["desc"] else ")") + notes
+    return (
+        f"OK: {name} {item['name']} {item['value']} -> {new_text_value}{matched}, "
+        f"line {item['line']} of visualizer/faces/{name}/index.html. Done: do not "
+        "call this again for the same request. The page reads values when it "
+        "loads, so tell Mark to refresh the face."
+    )
+
+
 REGISTRY = {
     "read_file": read_file,
     "write_file": write_file,
@@ -1395,6 +1749,8 @@ REGISTRY = {
     "list_faces": list_faces,
     "set_face": set_face,
     "show_face": show_face,
+    "face_tunables": face_tunables,
+    "set_face_tunable": set_face_tunable,
     "check_disk": ops_monitor.check_disk,
     "check_scheduled_tasks": ops_monitor.check_scheduled_tasks,
     "check_gpu_nvidia": ops_monitor.check_gpu_nvidia,
@@ -1675,6 +2031,36 @@ SCHEMAS = [
                     "face": {"type": "string", "description": "Name of an existing folder under visualizer/faces/, e.g. 'jarvis' or 'orbit'."},
                 },
                 "required": ["face"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "face_tunables",
+            "description": "Mark asks to change how a face looks or behaves (more or fewer objects, faster, bigger, a different color, 'this space', 'this face')? Use the face tools for it, never write_file or edit_file and never search for files. This one lists what can be adjusted on a face with current values and plain descriptions, read-only. Leave face empty for the face that's active right now. To actually change something, call set_face_tunable.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "face": {"type": "string", "description": "Face name, e.g. 'orbit'. Omit for the active face."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_face_tunable",
+            "description": "THE way to change a face: more or fewer objects, faster or slower, bigger or smaller, a different color. Never use write_file or edit_file for that. Pass 'what' in Mark's own words (copy his phrase) and 'value': a number, or 'double', 'half' or 'x3' to scale the current value, or a hex color like #0000ff. It finds the matching value itself, edits only that one value, reads it back, and tells you what it matched, so trust its OK or ERROR and do not call it again once it says OK. Omit face for the face that's active right now. The page reads values when it loads, so tell Mark to refresh the face to see it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "what": {"type": "string", "description": "What to change, in Mark's own words, copied from his request."},
+                    "value": {"type": "string", "description": "A number, or 'double' / 'half' / 'x3', or a hex color like #0000ff."},
+                    "face": {"type": "string", "description": "Face name. Omit for the active face."},
+                    "name": {"type": "string", "description": "Optional exact name from face_tunables, only if you have one."},
+                },
+                "required": ["what", "value"],
             },
         },
     },
