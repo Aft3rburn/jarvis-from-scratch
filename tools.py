@@ -57,6 +57,19 @@ def _source_edit_block_message(path: pathlib.Path, tool_name: str) -> str:
 VAULT_DIR = WORKSPACE / "vault"
 INDEX_FILE = VAULT_DIR / "INDEX.md"
 DAILY_DIR = VAULT_DIR / "daily"
+
+# Real gap found 2026-09-23: search_vault only ever looked in this small
+# local folder, never Mary's real vault - so "pull my active priorities"
+# and "what are your commits/updates" both came back "no matches" even
+# though the real answer lives one folder over. Fixed 2026-09-24 with a
+# deliberately narrow scope, not full access: Mark's explicit call was to
+# make Jarvis competent at his actual job (status/priorities questions),
+# not to hand a model with a documented fabrication/false-claim history
+# read access to personal/legal/family notes elsewhere in the real vault.
+# Only the single file that was actually missing gets added here.
+MARY_ACTIVE_PRIORITIES_FILE = (
+    pathlib.Path.home() / "OneDrive" / "Mary-Vault" / "Active Priorities.md"
+)
 LESSONS_FILE = VAULT_DIR / "LESSONS.md"
 TASKS_FILE = VAULT_DIR / "TASKS.md"
 
@@ -264,6 +277,35 @@ def _resolve(path: str) -> pathlib.Path:
     return p if p.is_absolute() else (WORKSPACE / p)
 
 
+def _outside_workspace_block_message(path: pathlib.Path) -> str | None:
+    """BLOCKED message if `path` resolves outside WORKSPACE, None
+    otherwise. Real gap found 2026-09-24 while scoping search_vault to
+    also read Mary's real Active Priorities.md (see
+    MARY_ACTIVE_PRIORITIES_FILE above): _resolve() passes any absolute
+    path straight through untouched, so nothing previously stopped
+    write_file/edit_file from writing anywhere on disk the model named,
+    including Mary's real vault - which isn't git-tracked, so there'd be
+    no clean checkout-based undo like Jarvis's own tools.py/agent.py get
+    when he clobbers them. No confirmed=true override, same reasoning as
+    _memory_file_block_message: the model can set that flag itself, so
+    it can't be what protects a file outside his own sandbox."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return None
+    workspace = WORKSPACE.resolve()
+    if resolved == workspace or workspace in resolved.parents:
+        return None
+    return (
+        f"BLOCKED: {path} is outside your own workspace "
+        f"({WORKSPACE}). write_file and edit_file can only touch files "
+        "inside it - never anywhere else on disk, including Mary's "
+        "vault or any other real file. This block has NO confirmed=true "
+        "override. If something outside your workspace genuinely needs "
+        "changing, tell Mark and have Mary do it."
+    )
+
+
 def _memory_file_block_message(path: pathlib.Path) -> str | None:
     """BLOCKED message if `path` is one of Jarvis's memory files, None
     otherwise. Real incident, 2026-09-20: asked to double the swarm in the
@@ -365,6 +407,9 @@ def write_file(args: dict) -> str:
     path = _resolve(args["path"])
     content = args.get("content", "")
     confirmed = bool(args.get("confirmed", False))
+    outside_block = _outside_workspace_block_message(path)
+    if outside_block:
+        return outside_block
     memory_block = _memory_file_block_message(path)
     if memory_block:
         return memory_block
@@ -673,13 +718,18 @@ def list_open_tasks(args: dict) -> str:
 
 def search_vault(args: dict) -> str:
     query = args["query"].lower()
-    if not VAULT_DIR.exists():
-        return "Vault is empty, no matches."
     hits = []
-    for path in sorted(VAULT_DIR.rglob("*.md")):
-        for line in path.read_text(encoding="utf-8").splitlines():
+    if VAULT_DIR.exists():
+        for path in sorted(VAULT_DIR.rglob("*.md")):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if query in line.lower():
+                    hits.append(f"{path.relative_to(VAULT_DIR)}: {line}")
+    # See MARY_ACTIVE_PRIORITIES_FILE above - the one deliberately-scoped
+    # exception to this tool only ever reading Jarvis's own small vault.
+    if MARY_ACTIVE_PRIORITIES_FILE.exists():
+        for line in MARY_ACTIVE_PRIORITIES_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
             if query in line.lower():
-                hits.append(f"{path.relative_to(VAULT_DIR)}: {line}")
+                hits.append(f"Mary/Active Priorities.md: {line}")
     if not hits:
         return f"No lines in the vault matched {query!r}."
     return "\n".join(hits)
@@ -795,6 +845,9 @@ def edit_file(args: dict) -> str:
     replace_all = bool(args.get("replace_all", False))
     confirmed = bool(args.get("confirmed", False))
 
+    outside_block = _outside_workspace_block_message(path)
+    if outside_block:
+        return outside_block
     memory_block = _memory_file_block_message(path)
     if memory_block:
         return memory_block
@@ -1755,6 +1808,7 @@ REGISTRY = {
     "check_scheduled_tasks": ops_monitor.check_scheduled_tasks,
     "check_gpu_nvidia": ops_monitor.check_gpu_nvidia,
     "check_gpu_amd": ops_monitor.check_gpu_amd,
+    "check_cpu_temp": ops_monitor.check_cpu_temp,
     "restart_hung_process": restart_hung_process,
 }
 
@@ -2111,6 +2165,14 @@ SCHEMAS = [
         "function": {
             "name": "check_gpu_amd",
             "description": "Report total GPU 3D-engine utilization across all GPUs on this machine (AMD 7900 XT + Nvidia A1000 combined - no per-vendor split, no temperature available). Use for a general 'check the gpu' question; use check_gpu_nvidia instead if specifically asked about the Nvidia card.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_cpu_temp",
+            "description": "Report the CPU package temperature in Celsius. Use this for any CPU temperature question - never substitute a GPU reading for a CPU one.",
             "parameters": {"type": "object", "properties": {}},
         },
     },

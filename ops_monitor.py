@@ -14,9 +14,16 @@ against real output that session. AMD GPU check is a real, honest
 exception - see check_gpu_amd's own docstring.
 """
 
+import pathlib
 import re
 import shutil
 import subprocess
+
+# The "Mary CPU Temp Monitor" scheduled task (LibreHardwareMonitor-backed,
+# see 'This AI-Server' in Mark's Mary vault, 04 - Personal, 2026-09-04 entry)
+# already writes a live-updating CPU temp reading here for Mary's own HUD -
+# reusing it instead of standing up a second elevated sensor path.
+_CPU_TEMP_FILE = pathlib.Path.home() / "my-agent" / "ai-visualizer" / ".cpu_temp"
 
 
 def _run_ps(script: str, timeout: int = 10) -> str:
@@ -153,6 +160,25 @@ def check_gpu_amd(args: dict) -> str:
         f"Windows box - see check_gpu_nvidia for the Nvidia card's own "
         f"temp/utilization/memory specifically."
     )
+
+
+def check_cpu_temp(args: dict) -> str:
+    """Report the CPU package temperature. Real gap closed 2026-09-24:
+    no CPU temp tool existed before this - a real voice session asked
+    for CPU temp twice and Jarvis kept substituting GPU readings instead
+    of saying it couldn't check, since check_gpu_amd/check_gpu_nvidia
+    were the only thermal tools available. Reads the same
+    LibreHardwareMonitor-backed .cpu_temp bus file Mary's own visualizer
+    HUD already displays (see check_gpu_amd's module note on why AMD has
+    no built-in temp counter on Windows - the CPU path already had a
+    real sensor, it just wasn't wired to a tool)."""
+    try:
+        raw = _CPU_TEMP_FILE.read_text(encoding="utf-8").strip()
+    except OSError as e:
+        return f"ERROR: couldn't read CPU temp file at {_CPU_TEMP_FILE}: {e}"
+    if not raw:
+        return "ERROR: CPU temp file exists but is empty - the monitor task may not be running."
+    return f"CPU package temperature: {raw}C"
 
 
 def check_gpu_nvidia(args: dict) -> str:

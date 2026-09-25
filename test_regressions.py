@@ -554,6 +554,57 @@ class TestZeroToolsEnforcement(unittest.TestCase):
         self.assertEqual(messages[-1]["content"], "Everything's quiet, nothing open.")
 
 
+class TestToolErrorStreakGuard(unittest.TestCase):
+    """Real incident, 2026-09-23: asked to add GPU utilization lines to a
+    face, set_face_tunable kept returning an ERROR telling the model to
+    ask Mark which option he meant, and the model just retried with
+    near-identical bad arguments 10 straight times instead of ever
+    asking. No guard existed for a well-formed call that keeps failing,
+    only for malformed-format calls (see TestFabricationGiveUpGate).
+    Fix: a tool that errors MAX_TOOL_ERROR_RETRIES+1 times in a row gets
+    pulled from allowed_tools for the rest of the turn."""
+
+    def test_repeated_tool_error_pulls_tool_and_forces_a_different_path(self):
+        error_msg = (
+            "ERROR: nothing here clearly matches what Mark said. "
+            "Options: SQUASH = .32; MIC_N = 32. Nothing changed. "
+            "Ask Mark which one he means."
+        )
+        scripted = _ScriptedOllama([
+            _real_tool_call_message("set_face_tunable", {"value": "half"}),  # streak 1
+            _real_tool_call_message("set_face_tunable", {"value": "half"}),  # streak 2
+            _real_tool_call_message("set_face_tunable", {"value": "half"}),  # streak 3: tool pulled
+            _plain_text_message(
+                "I'm not sure which setting you mean - could you say "
+                "which one specifically?"
+            ),
+        ])
+        messages = [
+            {"role": "user", "content": "add GPU utilization lines to this face"}
+        ]
+        with patch.object(agent, "call_ollama", scripted), \
+             patch.dict(tools.REGISTRY, {"set_face_tunable": lambda args: error_msg}):
+            result = agent._agentic_turn(messages, speak_answer=False)
+
+        self.assertEqual(
+            scripted.calls, 4,
+            "expected exactly 3 failed tool calls then one plain-text "
+            "answer - not 10 straight retries like the real incident.",
+        )
+        tool_messages = [m for m in messages if m.get("role") == "tool"]
+        self.assertEqual(
+            len(tool_messages), 3,
+            "the tool must stop being called after its error budget is "
+            "spent, not keep executing indefinitely.",
+        )
+        self.assertIn(
+            "which one", result["answer"].lower(),
+            "once the tool's pulled, the model's final answer should "
+            "surface the real ambiguity instead of another blind guess - "
+            "got: " + repr(result["answer"]),
+        )
+
+
 class TestOpsMonitorInputHardening(unittest.TestCase):
     """Two real bugs caught live 2026-09-10 wiring the ops-monitor tools
     into the fast-lane router: the small model garbled a tool argument,
@@ -864,12 +915,63 @@ class MemoryFileWriteBlockTests(unittest.TestCase):
         self.assertIsNone(tools._memory_file_block_message(tools.INDEX_FILE))
         self.assertIsNone(tools._memory_file_block_message(
             tools.WORKSPACE / "visualizer" / "faces" / "orbit" / "index.html"))
-        with tempfile.TemporaryDirectory() as d:
+        # Rooted inside WORKSPACE deliberately, not a bare system temp dir -
+        # see TestOutsideWorkspaceBlock below: 2026-09-24 closed a real gap
+        # where write_file/edit_file could write anywhere on disk, so an
+        # ordinary-file test now has to live inside the sandbox too.
+        with tempfile.TemporaryDirectory(dir=tools.WORKSPACE) as d:
             f = pathlib.Path(d) / "scratch.txt"
             self.assertTrue(tools.write_file({"path": str(f), "content": "hi"}).startswith("OK:"))
             self.assertTrue(tools.edit_file(
                 {"path": str(f), "old_string": "hi", "new_string": "yo"}).startswith("OK:"))
             self.assertEqual(f.read_text(encoding="utf-8"), "yo")
+
+
+class TestOutsideWorkspaceBlock(unittest.TestCase):
+    """Real gap found 2026-09-24 while scoping search_vault to also read
+    Mary's real Active Priorities.md: _resolve() passed any absolute path
+    straight through untouched, so nothing stopped write_file/edit_file
+    from writing anywhere on disk the model named - including Mary's real
+    vault, which isn't git-tracked and has no clean checkout-based undo
+    like Jarvis's own tools.py/agent.py get when he clobbers them."""
+
+    def test_write_file_blocks_absolute_path_outside_workspace(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = pathlib.Path(d) / "not_mine.md"
+            target.write_text("original content", encoding="utf-8")
+            result = tools.write_file({"path": str(target), "content": "CLOBBERED"})
+            self.assertTrue(result.startswith("BLOCKED:"), result)
+            self.assertNotIn("confirmed", result.lower().split("no ")[0])
+            self.assertEqual(target.read_text(encoding="utf-8"), "original content")
+
+    def test_write_file_blocks_even_with_confirmed_true(self):
+        """No confirmed=true override - the model sets that flag itself,
+        same reasoning as _memory_file_block_message."""
+        with tempfile.TemporaryDirectory() as d:
+            target = pathlib.Path(d) / "not_mine.md"
+            target.write_text("original content", encoding="utf-8")
+            result = tools.write_file(
+                {"path": str(target), "content": "CLOBBERED", "confirmed": True}
+            )
+            self.assertTrue(result.startswith("BLOCKED:"), result)
+            self.assertEqual(target.read_text(encoding="utf-8"), "original content")
+
+    def test_edit_file_blocks_absolute_path_outside_workspace(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = pathlib.Path(d) / "not_mine.md"
+            target.write_text("original content", encoding="utf-8")
+            result = tools.edit_file(
+                {"path": str(target), "old_string": "original", "new_string": "CLOBBERED"}
+            )
+            self.assertTrue(result.startswith("BLOCKED:"), result)
+            self.assertEqual(target.read_text(encoding="utf-8"), "original content")
+
+    def test_files_inside_workspace_still_writable(self):
+        with tempfile.TemporaryDirectory(dir=tools.WORKSPACE) as d:
+            target = pathlib.Path(d) / "scratch.txt"
+            result = tools.write_file({"path": str(target), "content": "fine"})
+            self.assertTrue(result.startswith("OK:"), result)
+            self.assertEqual(target.read_text(encoding="utf-8"), "fine")
 
 
 class UnbackedChangeClaimGuardTests(unittest.TestCase):

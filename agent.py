@@ -530,9 +530,26 @@ def _agentic_turn(
     change_claim_retries = 0
     MAX_CHANGE_CLAIM_RETRIES = 1
 
+    # Real incident, 2026-09-23: asked to add GPU utilization lines to a
+    # face, set_face_tunable kept returning "ERROR: ... Ask Mark which
+    # one he means" and the model just retried with near-identical bad
+    # arguments 10 straight times instead of ever asking - no guard
+    # existed for a well-formed call that keeps failing, only for the
+    # malformed-format case above. Tracks consecutive ERROR results from
+    # the same tool name; once the budget's spent, that tool is pulled
+    # from what the model's allowed to call for the rest of this turn,
+    # forcing either a different real tool or a plain-text answer -
+    # same "don't trust a prompt-only instruction" lesson this codebase
+    # already learned the hard way on face-look claims (see
+    # _FACE_LOOK_CLAIM_RE above).
+    current_allowed_tools = set(tools.REGISTRY) if allowed_tools is None else set(allowed_tools)
+    tool_error_streak = 0
+    last_error_tool = None
+    MAX_TOOL_ERROR_RETRIES = 2
+
     for step in range(1, MAX_STEPS + 1):
         print(f"\n--- step {step}: asking {model} ---")
-        response = call_ollama(messages, allowed_tools, model=model, url=url)
+        response = call_ollama(messages, current_allowed_tools, model=model, url=url)
         message = response["message"]
         messages.append(message)
 
@@ -814,13 +831,13 @@ def _agentic_turn(
                 name == "face_tunables"
                 and isinstance(args, dict)
                 and args.get("value") not in (None, "")
-                and (allowed_tools is None or "set_face_tunable" in allowed_tools)
+                and "set_face_tunable" in current_allowed_tools
             ):
                 print("(face_tunables was called with a value - treating it as set_face_tunable)")
                 name = "set_face_tunable"
 
             print(f"tool call: {name}({args})")
-            if allowed_tools is not None and name not in allowed_tools:
+            if name not in current_allowed_tools:
                 result = f"ERROR: tool '{name}' is not permitted for this task."
             else:
                 handler = tools.REGISTRY.get(name)
@@ -833,6 +850,42 @@ def _agentic_turn(
             print(f"tool result: {result[:500]}")
 
             messages.append({"role": "tool", "content": result, "name": name})
+
+            # See MAX_TOOL_ERROR_RETRIES above: a tool that keeps erroring
+            # on repeated calls gets pulled from this turn's allowed set
+            # instead of letting the model retry it forever.
+            if isinstance(result, str) and result.startswith("ERROR"):
+                if name == last_error_tool:
+                    tool_error_streak += 1
+                else:
+                    last_error_tool = name
+                    tool_error_streak = 1
+                if tool_error_streak > MAX_TOOL_ERROR_RETRIES and name in current_allowed_tools:
+                    current_allowed_tools = current_allowed_tools - {name}
+                    print(
+                        f"\n({name!r} has failed {tool_error_streak} times "
+                        "in a row with an ERROR result - pulling it from "
+                        "this turn's allowed tools so the model has to ask "
+                        "Mark or answer honestly instead of retrying blind)"
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"That tool ({name}) has failed the same "
+                                "way several times in a row and won't work "
+                                "by retrying it again with different "
+                                "guesses. Stop calling it. Either ask me "
+                                "directly which option I mean, quoting the "
+                                "tool's own error message, or tell me "
+                                "plainly you're not sure - do not invent "
+                                "another guess."
+                            ),
+                        }
+                    )
+            else:
+                last_error_tool = None
+                tool_error_streak = 0
 
             # Any state-changing tool that came back without an error or a
             # block - see _CHANGE_CLAIM_RE above.
