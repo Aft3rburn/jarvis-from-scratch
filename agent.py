@@ -33,6 +33,14 @@ OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL = "granite4:tiny-h"
 MAX_STEPS = 30
 
+# 2026-09-25: face-edit requests (router.EDIT, see router.py's
+# _is_face_edit) route to qwen3-coder:30b instead of MODEL - same
+# default OLLAMA_URL/7900 XT, just a model that's actually good at
+# precise file edits, since granite's own incident history on this exact
+# task shape (circuit clobber, aether->blue_board, swarm-doubling) is
+# the worst of any task category it handles.
+EDIT_MODEL = "qwen3-coder:30b"
+
 # Remote granite, added 2026-09-20. qwen3-coder:30b (18GB) fills this
 # machine's 7900 XT, so granite can't stay resident beside it without a
 # reload on every model switch. ADLAPTOP (12GB VRAM, wired LAN, firewall
@@ -205,6 +213,19 @@ _STATE_CHANGING_TOOLS = {
 
 def _touches_face_file(path_str: str) -> bool:
     return bool(re.search(r"faces[\\/]", path_str, re.IGNORECASE))
+
+
+_FACE_NAME_RE = re.compile(r"faces[\\/]([^\\/]+)[\\/]", re.IGNORECASE)
+
+
+def _face_name_from_path(path_str: str) -> str | None:
+    """The face name a path belongs to (e.g. 'aether' from
+    '.../faces/aether/index.html'), or None if it isn't a face path.
+    Used by the read-before-edit gate below - comparing face NAMES, not
+    just 'is this any face file', is what stops 'read aether, edit
+    circuit' from passing as if aether had been checked."""
+    m = _FACE_NAME_RE.search(path_str)
+    return m.group(1).lower() if m else None
 
 
 SYSTEM_PROMPT = (
@@ -547,6 +568,17 @@ def _agentic_turn(
     last_error_tool = None
     MAX_TOOL_ERROR_RETRIES = 2
 
+    # Real pattern across nearly every face-editing incident on record
+    # (the circuit clobber, the aether->blue_board restyle-vs-switch, the
+    # swarm-doubling edit that hit the wrong file entirely): the model
+    # acted on a face's file without ever having actually read it this
+    # turn - it guessed, or edited a face it found by searching
+    # somewhere else. Tracks which faces got a real read_file this turn,
+    # by name, so write_file/edit_file can require it before touching
+    # that same face - grounding enforced before the edit, not a claim
+    # checked after the fact like _FACE_LOOK_CLAIM_RE above.
+    read_face_files = set()
+
     for step in range(1, MAX_STEPS + 1):
         print(f"\n--- step {step}: asking {model} ---")
         response = call_ollama(messages, current_allowed_tools, model=model, url=url)
@@ -837,8 +869,32 @@ def _agentic_turn(
                 name = "set_face_tunable"
 
             print(f"tool call: {name}({args})")
+            target_face = (
+                _face_name_from_path(str(args.get("path", "")))
+                if isinstance(args, dict) else None
+            )
             if name not in current_allowed_tools:
                 result = f"ERROR: tool '{name}' is not permitted for this task."
+            elif (
+                name in ("write_file", "edit_file")
+                and target_face is not None
+                and target_face not in read_face_files
+            ):
+                # See read_face_files above - a face edit with no real
+                # read_file on that exact face this turn is refused
+                # before it can do anything, not caught after the fact.
+                # Deliberately an ERROR, not BLOCKED: BLOCKED ends the
+                # turn and waits for Mark to reply again, which is wrong
+                # here - the right next step (read_file, then retry the
+                # edit) is available in this same turn, no confirmation
+                # needed.
+                result = (
+                    f"ERROR: you haven't actually read {target_face}'s own "
+                    f"index.html this turn. Call read_file on that exact "
+                    f"path first, then edit based on what it really "
+                    f"contains - do not guess, and do not edit a "
+                    f"different face instead."
+                )
             else:
                 handler = tools.REGISTRY.get(name)
                 if handler is None:
@@ -847,6 +903,14 @@ def _agentic_turn(
                     if name in ("face_tunables", "set_face_tunable"):
                         args = dict(args or {}, _request=request_text, _turn=turn_id)
                     result = handler(args)
+                    if (
+                        name == "read_file"
+                        and isinstance(result, str)
+                        and not result.startswith("ERROR")
+                    ):
+                        read_face = _face_name_from_path(str(args.get("path", "")))
+                        if read_face is not None:
+                            read_face_files.add(read_face)
             print(f"tool result: {result[:500]}")
 
             messages.append({"role": "tool", "content": result, "name": name})
@@ -969,7 +1033,13 @@ def run_task(
     invented one. run_voice_loop passes its own persistent `history` list
     so consecutive voice commands finally share real memory, the same way
     run_chat's turns always have."""
-    if router.classify(task) == router.FAST:
+    classification = router.classify(task)
+    chosen_model = MODEL
+    if classification == router.EDIT:
+        print(f"\n[router] classified EDIT -> {EDIT_MODEL} (face-edit task shape)")
+        chosen_model = EDIT_MODEL
+
+    if classification == router.FAST:
         print(f"\n[router] classified FAST -> {FAST_MODEL} on the isolated GPU")
         fast_messages = [
             {"role": "system", "content": FAST_SYSTEM_PROMPT},
@@ -1008,8 +1078,15 @@ def run_task(
             {"role": "user", "content": task},
         ]
     try:
-        _agentic_turn(messages, speak_answer, task_desc=task)
+        _agentic_turn(messages, speak_answer, model=chosen_model, task_desc=task)
     except OllamaUnavailable as e:
+        if chosen_model != MODEL:
+            print(f"\n[router] {chosen_model} unreachable ({e}), falling back to {MODEL}")
+            try:
+                _agentic_turn(messages, speak_answer, task_desc=task)
+                return
+            except OllamaUnavailable as e2:
+                e = e2
         print(f"\n=== error ===\n{e}")
         if speak_answer:
             voice.speak("I can't reach Ollama right now. Is it running?")

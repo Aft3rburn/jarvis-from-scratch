@@ -81,6 +81,43 @@ def _face_name_switch_pattern() -> "re.Pattern | None":
 
 _FACE_NAME_SWITCH_RE = _face_name_switch_pattern()
 
+# 2026-09-25: face EDITS (restyle, add a feature, tweak a value) are a
+# different job from face SWITCHES above, and this project's own incident
+# history shows granite4:tiny-h is specifically bad at them - the circuit
+# clobber, the aether->blue_board restyle-vs-switch confusion, the
+# swarm-doubling edit that hit the wrong file. Route this shape to
+# qwen3-coder:30b instead: face edits aren't latency-sensitive spoken
+# answers, they're deliberate, occasional customization Mark can afford
+# to wait ~20-30s longer for in exchange for a model that's actually good
+# at precise file edits. Deliberately loose (verb + style/content noun
+# anywhere in the message, no strict ordering) since a false positive here
+# just means qwen3-coder answers a request that wasn't really a face
+# edit - a mild cost, nothing like the FAST/FULL fabrication risk.
+_FACE_EDIT_VERBS_RE = re.compile(
+    r"\b(add|change|edit|restyle|modify|update|give|make|increase|"
+    r"decrease|double|adjust)\b",
+    re.IGNORECASE,
+)
+_FACE_EDIT_NOUNS_RE = re.compile(
+    r"\b(color|colour|motif|palette|scheme|hue|tint|lines?|feature|"
+    r"swarm|particles?|density|font)\b",
+    re.IGNORECASE,
+)
+
+
+def _mentions_a_face(text: str) -> bool:
+    if re.search(r"\bface\b", text, re.IGNORECASE):
+        return True
+    return any(re.search(rf"\b{re.escape(n)}\b", text, re.IGNORECASE) for n in _face_names())
+
+
+def _is_face_edit(text: str) -> bool:
+    return bool(
+        _FACE_EDIT_VERBS_RE.search(text)
+        and _FACE_EDIT_NOUNS_RE.search(text)
+        and _mentions_a_face(text)
+    )
+
 # Any of these appearing anywhere in the request is a strong signal it
 # needs real reasoning, generation, or multi-step work - never fast-path
 # these, no matter how short the message is. Deliberately broad/loose
@@ -133,16 +170,23 @@ _LONG_MESSAGE_WORD_THRESHOLD = 20
 
 FAST = "fast"
 FULL = "full"
+EDIT = "edit"
 
 
 def classify(text: str) -> str:
-    """Return FAST or FULL for a given request. Pure function, no model
-    call, sub-millisecond - the entire point is to decide BEFORE paying
-    for any model's time. Errs toward FULL when unsure (see module
-    docstring for why)."""
+    """Return FAST, FULL, or EDIT for a given request. Pure function, no
+    model call, sub-millisecond - the entire point is to decide BEFORE
+    paying for any model's time. Errs toward FULL when unsure (see module
+    docstring for why). EDIT (see _is_face_edit above) is checked first
+    since it's the most specific signal - a request that both edits a
+    face AND happens to contain a switch verb (e.g. "change aether's
+    color") is an edit, not a switch."""
     stripped = text.strip()
     if not stripped:
         return FAST  # empty/no-op input, nothing to reason about either way
+
+    if _is_face_edit(stripped):
+        return EDIT
 
     if _FACE_SWITCH_RE.search(stripped):
         return FULL

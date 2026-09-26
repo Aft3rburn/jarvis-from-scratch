@@ -605,6 +605,78 @@ class TestToolErrorStreakGuard(unittest.TestCase):
         )
 
 
+class TestReadBeforeFaceEditGate(unittest.TestCase):
+    """Real pattern across nearly every face-editing incident on record
+    (the circuit clobber 2026-09-18, the aether->blue_board
+    restyle-vs-switch 2026-09-17, the swarm-doubling edit that hit the
+    wrong file entirely 2026-09-20): the model acted on a face's file
+    without ever having actually read it this turn. Fixed 2026-09-25:
+    write_file/edit_file on a faces/<name>/... path is refused until
+    read_file has actually succeeded on that exact face's path this
+    turn - grounding enforced before the edit, not a claim checked after."""
+
+    def test_edit_without_reading_the_face_first_is_refused_then_succeeds_after_reading(self):
+        scripted = _ScriptedOllama([
+            _real_tool_call_message(
+                "edit_file",
+                {"path": "visualizer/faces/aether/index.html",
+                 "old_string": "blue", "new_string": "teal"},
+            ),  # blocked - never read aether first
+            _real_tool_call_message(
+                "read_file", {"path": "visualizer/faces/aether/index.html"},
+            ),  # now reads the real file
+            _real_tool_call_message(
+                "edit_file",
+                {"path": "visualizer/faces/aether/index.html",
+                 "old_string": "blue", "new_string": "teal"},
+            ),  # retries - now allowed
+            _plain_text_message("Aether's color has been changed to teal."),
+        ])
+        messages = [{"role": "user", "content": "give aether a teal motif"}]
+        with patch.object(agent, "call_ollama", scripted), \
+             patch.dict(tools.REGISTRY, {
+                 "read_file": lambda args: "some html with blue in it",
+                 "edit_file": lambda args: "OK: replaced 1 occurrence(s)",
+             }):
+            agent._agentic_turn(messages, speak_answer=False)
+
+        tool_results = [m["content"] for m in messages if m.get("role") == "tool"]
+        self.assertTrue(
+            tool_results[0].startswith("ERROR") and "haven't actually read" in tool_results[0],
+            "first edit attempt (no read_file yet) must be refused: " + repr(tool_results[0]),
+        )
+        self.assertEqual(tool_results[2], "OK: replaced 1 occurrence(s)",
+                          "second edit attempt, after a real read_file on the same face, must go through")
+
+    def test_reading_a_different_face_does_not_authorize_editing_this_one(self):
+        """Real incident shape, 2026-09-17: asked to restyle aether, the
+        model acted on blue_board instead. Reading circuit's file must
+        never authorize an edit to aether's."""
+        scripted = _ScriptedOllama([
+            _real_tool_call_message("read_file", {"path": "visualizer/faces/circuit/index.html"}),
+            _real_tool_call_message(
+                "edit_file",
+                {"path": "visualizer/faces/aether/index.html",
+                 "old_string": "blue", "new_string": "teal"},
+            ),
+            _plain_text_message("I haven't actually changed aether yet - which file should I edit?"),
+        ])
+        messages = [{"role": "user", "content": "give aether a teal motif"}]
+        with patch.object(agent, "call_ollama", scripted), \
+             patch.dict(tools.REGISTRY, {
+                 "read_file": lambda args: "some html content",
+                 "edit_file": lambda args: "OK: replaced 1 occurrence(s)",
+             }):
+            agent._agentic_turn(messages, speak_answer=False)
+
+        tool_results = [m["content"] for m in messages if m.get("role") == "tool"]
+        self.assertTrue(
+            tool_results[1].startswith("ERROR") and "haven't actually read" in tool_results[1],
+            "reading circuit's file must not authorize editing aether's - "
+            "got: " + repr(tool_results[1]),
+        )
+
+
 class TestOpsMonitorInputHardening(unittest.TestCase):
     """Two real bugs caught live 2026-09-10 wiring the ops-monitor tools
     into the fast-lane router: the small model garbled a tool argument,
@@ -759,6 +831,56 @@ class TestFastLaneEscalationSpeaksOnce(unittest.TestCase):
             f"spoken: {speak_mock.call_args_list}",
         )
         self.assertIn(agent.MODEL, ollama.calls)
+
+
+class TestFaceEditRoutesToQwenCoder(unittest.TestCase):
+    """2026-09-25: face-edit requests (router.EDIT) route to
+    agent.EDIT_MODEL (qwen3-coder:30b) instead of granite - the incident
+    history on this exact task shape (circuit clobber, aether->blue_board,
+    swarm-doubling) is granite's worst of any category, so precision
+    file edits go to a model that's actually good at them."""
+
+    def test_edit_classification_calls_edit_model_not_granite(self):
+        answer = "Aether's motif is now blue."
+        ollama = _ModelRoutingOllama({
+            agent.EDIT_MODEL: [_plain_text_message(answer)],
+            agent.MODEL: [_plain_text_message("SHOULD NEVER BE CALLED")],
+        })
+        with patch.object(agent.router, "classify", return_value=agent.router.EDIT), \
+             patch.object(agent, "call_ollama", ollama), \
+             patch.object(agent, "_build_system_prompt", return_value="stub"), \
+             patch.object(agent.voice, "speak") as speak_mock:
+            agent.run_task("give aether a blue motif", speak_answer=True)
+
+        self.assertIn(agent.EDIT_MODEL, ollama.calls)
+        self.assertNotIn(
+            agent.MODEL, ollama.calls,
+            "a clean EDIT-model answer must not also wake granite - "
+            f"calls went to: {ollama.calls}",
+        )
+        self.assertEqual(speak_mock.call_count, 1)
+        self.assertEqual(speak_mock.call_args_list[0][0][0], answer)
+
+    def test_edit_model_unreachable_falls_back_to_granite(self):
+        answer = "Aether's motif is now blue."
+        ollama = _ModelRoutingOllama({
+            agent.MODEL: [_plain_text_message(answer)],
+        })
+
+        def flaky(messages, allowed_tools=None, model=None, url=None):
+            if model == agent.EDIT_MODEL:
+                raise agent.OllamaUnavailable("connection refused")
+            return ollama(messages, allowed_tools=allowed_tools, model=model, url=url)
+
+        with patch.object(agent.router, "classify", return_value=agent.router.EDIT), \
+             patch.object(agent, "call_ollama", flaky), \
+             patch.object(agent, "_build_system_prompt", return_value="stub"), \
+             patch.object(agent.voice, "speak") as speak_mock:
+            agent.run_task("give aether a blue motif", speak_answer=True)
+
+        self.assertIn(agent.MODEL, ollama.calls)
+        self.assertEqual(speak_mock.call_count, 1)
+        self.assertEqual(speak_mock.call_args_list[0][0][0], answer)
 
 
 class FaceLookClaimRegexTests(unittest.TestCase):

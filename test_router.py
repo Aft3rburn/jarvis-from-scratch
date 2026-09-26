@@ -9,7 +9,7 @@ traffic before it ships. Run with:
 
 import unittest
 
-from router import classify, FAST, FULL
+from router import classify, FAST, FULL, EDIT
 
 
 class TestRouterClassify(unittest.TestCase):
@@ -95,6 +95,34 @@ class TestRouterClassify(unittest.TestCase):
                     f"{text!r} should stay on the full model - "
                     "the fast lane picks the wrong face tool too often",
                 )
+
+    def test_face_edit_requests_route_to_edit_not_full(self):
+        # Real incident phrasings, 2026-09-17 and 2026-09-23/24: granite's
+        # worst-documented failure category. These now route to
+        # qwen3-coder:30b (see agent.py's EDIT_MODEL) instead of granite,
+        # not the plain FULL lane.
+        face_edit_requests = [
+            "make the aether face have a blue motif",
+            "give the aether face a blue motif",
+            "add GPU utilization lines to this face",
+            "can you change the circuit face's color scheme",
+            "increase the swarm particles on the orbit face",
+        ]
+        for text in face_edit_requests:
+            with self.subTest(text=text):
+                self.assertEqual(
+                    classify(text), EDIT,
+                    f"{text!r} should route to the face-edit model, not "
+                    "granite - this is exactly the task shape it keeps "
+                    "failing on",
+                )
+
+    def test_face_switch_alone_is_still_full_not_edit(self):
+        # A plain switch with no style/content noun must stay FULL/granite
+        # - only a genuine edit-shaped request should escalate to EDIT.
+        for text in ["bring up aether", "switch to the circuit face", "open orbit"]:
+            with self.subTest(text=text):
+                self.assertEqual(classify(text), FULL)
 
     def test_long_message_defaults_full_even_without_keywords(self):
         long_text = (
