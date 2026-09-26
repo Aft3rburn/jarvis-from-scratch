@@ -1281,7 +1281,17 @@ def set_face(args: dict) -> str:
         return "ERROR: no face name given."
     face_dir = VISUALIZER_DIR / "faces" / name
     if not (face_dir / "index.html").exists():
-        return f"ERROR: no face named '{name}' in visualizer/faces/ - call list_faces to see what's actually there."
+        # 2026-09-25: flagged as an open bench item back in September and
+        # never closed - "ether"/"acer" for "aether", the same class of
+        # speech-recognition slip _resolve_face_for_tunables already
+        # handles for face_tunables/set_face_tunable, but this tool never
+        # got the equivalent fix. Suggest, don't guess: a wrong auto-pick
+        # here actually switches the visible face, which is a bigger
+        # blast radius than a tunables error message.
+        close = difflib.get_close_matches(name.lower(), _face_names(), n=2, cutoff=0.5)
+        hint = f" Did you mean {' or '.join(repr(c) for c in close)}?" if close else ""
+        return (f"ERROR: no face named '{name}' in visualizer/faces/.{hint} "
+                f"Call list_faces to see what's actually there.")
     try:
         cfg = json.loads(VISUALIZER_CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):

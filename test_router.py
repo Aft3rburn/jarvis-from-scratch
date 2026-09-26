@@ -117,6 +117,33 @@ class TestRouterClassify(unittest.TestCase):
                     "failing on",
                 )
 
+    def test_context_free_edit_request_needs_active_face_to_route_edit(self):
+        # Real live incident, 2026-09-25: "make the main orbs have more of
+        # a trail" is verb+noun edit-shaped but names no face and never
+        # says "face" - it leans entirely on Mark having just been talking
+        # about the orbit face. With no active_face passed, classify()
+        # can't assume that context and must NOT force EDIT - it falls
+        # through to the ordinary word-count-based FULL default instead
+        # (9 words, no other signal matches). With the active face passed
+        # in (agent.py's run_task now does this via
+        # tools._active_face_name()), the same sentence correctly routes
+        # to EDIT instead of getting silently handled by granite on the
+        # plain FULL lane.
+        text = "make the main orbs have more of a trail"
+        self.assertEqual(classify(text), FULL)
+        self.assertEqual(classify(text, active_face="orbit"), EDIT)
+
+    def test_edit_noun_and_face_name_still_required_even_with_active_face(self):
+        # active_face must never turn an unrelated sentence into an edit -
+        # it only ever helps a request that's already verb+noun-shaped
+        # through when it names no face itself (see _is_face_edit).
+        self.assertEqual(
+            classify("what time is it", active_face="orbit"), FAST
+        )
+        self.assertEqual(
+            classify("restart the visualizer", active_face="orbit"), FAST
+        )
+
     def test_face_switch_alone_is_still_full_not_edit(self):
         # A plain switch with no style/content noun must stay FULL/granite
         # - only a genuine edit-shaped request should escalate to EDIT.

@@ -905,6 +905,178 @@ class FaceLookClaimRegexTests(unittest.TestCase):
             self.assertFalse(agent._FACE_LOOK_CLAIM_RE.search(text), text)
 
 
+class FaceCreateClaimRegexTests(unittest.TestCase):
+    """Sibling to FaceLookClaimRegexTests above, but for a face-CREATION
+    claim rather than a restyle. See _FACE_CREATE_CLAIM_RE."""
+
+    def test_creation_claims_are_flagged(self):
+        for text in (
+            "I've created a new face for you, fully original.",
+            "I built a brand new face with a swirling gradient.",
+            "Your new face is ready.",
+            "The face is done - take a look.",
+        ):
+            self.assertTrue(agent._FACE_CREATE_CLAIM_RE.search(text), text)
+
+    def test_switch_and_restyle_claims_do_not_false_positive(self):
+        for text in (
+            "Switched the face to circuit.",
+            "I gave the aether face a blue motif.",
+            "Your active visual face is currently set to 'circuit'.",
+        ):
+            self.assertFalse(agent._FACE_CREATE_CLAIM_RE.search(text), text)
+
+
+class FaceCreateClaimGuardTests(unittest.TestCase):
+    """2026-09-17: asked for '100% original face,' the model wrote a
+    static webpage with an invented schema - no core.js include, no
+    AV.tick(dt) call, the two things every real face in
+    visualizer/faces/ actually has - then reported it as done. Built and
+    tested in isolation that night, then deliberately reverted unfinished
+    (Mark's call, to fold it into the queued bench work instead of
+    shipping a fifth guard at 12:30 AM). Built for real 2026-09-25,
+    alongside the fix (see the read-before-edit gate's exists() check)
+    for the gate this scenario ran into: a brand-new face has nothing to
+    read_file first, so that gate must not block its initial write_file
+    the way it correctly blocks a blind edit of an EXISTING face."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = pathlib.Path(self.tmp.name)
+        (root / "faces" / "newface").mkdir(parents=True)
+        self.root = root
+        self.patch = patch.object(tools, "VISUALIZER_DIR", root)
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        self.tmp.cleanup()
+
+    def _write_face(self, content):
+        (self.root / "faces" / "newface" / "index.html").write_text(content, encoding="utf-8")
+
+    def test_fabricated_face_created_claim_gets_retried_then_replaced(self):
+        # The file must not exist before the scripted write_file call -
+        # the read-before-edit gate only exempts a face that doesn't
+        # exist yet (see agent.py's exists() check), and this test is
+        # specifically exercising a brand-new-face creation. The mocked
+        # handler writes the (structurally invalid) content itself, same
+        # as the real write_file tool would on this exact incident shape.
+        def fake_write_file(args):
+            self._write_face("<html><body>a plain static page, no core, no tick</body></html>")
+            return "OK: wrote 1 file"
+
+        scripted = _ScriptedOllama([
+            _real_tool_call_message(
+                "write_file",
+                {"path": "visualizer/faces/newface/index.html", "content": "irrelevant"},
+            ),
+            _plain_text_message("I've created a brand new face for you, fully original."),
+            _plain_text_message("I've created a brand new face for you, fully original."),
+        ])
+        messages = [{"role": "user", "content": "make me a 100% original face"}]
+        with patch.object(agent, "call_ollama", scripted), \
+             patch.dict(tools.REGISTRY, {"write_file": fake_write_file}):
+            result = agent._agentic_turn(messages, speak_answer=False)
+
+        self.assertEqual(scripted.calls, 3, "must force exactly one retry before giving up")
+        self.assertIn("not actually a working one", result["answer"])
+        self.assertNotIn("fully original", result["answer"])
+
+    def test_genuinely_valid_face_creation_claim_passes_through(self):
+        def fake_write_file(args):
+            self._write_face(
+                '<html><body>\n<script src="../../core.js"></script>\n'
+                '<script>function tick(dt){AV.tick(dt);}</script>\n</body></html>'
+            )
+            return "OK: wrote 1 file"
+
+        scripted = _ScriptedOllama([
+            _real_tool_call_message(
+                "write_file",
+                {"path": "visualizer/faces/newface/index.html", "content": "irrelevant"},
+            ),
+            _plain_text_message("I've created a brand new face for you."),
+        ])
+        messages = [{"role": "user", "content": "make me a new face"}]
+        with patch.object(agent, "call_ollama", scripted), \
+             patch.dict(tools.REGISTRY, {"write_file": fake_write_file}):
+            result = agent._agentic_turn(messages, speak_answer=False)
+
+        self.assertEqual(scripted.calls, 2, "a genuinely valid creation must not be retried")
+        self.assertEqual(result["answer"], "I've created a brand new face for you.")
+
+    def test_write_file_on_a_brand_new_face_is_not_blocked_by_the_read_before_edit_gate(self):
+        # The read-before-edit gate (agent.py, same block this test's
+        # sibling class exercises) must only refuse a write/edit to a face
+        # whose index.html already exists - a face that doesn't exist yet
+        # has nothing to read_file first, so demanding one would make
+        # creating any new face impossible.
+        self._write_face("placeholder - overwritten by the scripted write_file call below")
+        (self.root / "faces" / "newface" / "index.html").unlink()
+        scripted = _ScriptedOllama([
+            _real_tool_call_message(
+                "write_file",
+                {"path": "visualizer/faces/newface/index.html", "content": "irrelevant"},
+            ),
+            _plain_text_message("Done."),
+        ])
+        messages = [{"role": "user", "content": "make me a new face"}]
+        with patch.object(agent, "call_ollama", scripted), \
+             patch.dict(tools.REGISTRY, {"write_file": lambda args: "OK: wrote 1 file"}):
+            agent._agentic_turn(messages, speak_answer=False)
+
+        tool_results = [m["content"] for m in messages if m.get("role") == "tool"]
+        self.assertEqual(tool_results[0], "OK: wrote 1 file",
+                          "a write to a face that doesn't exist yet must go through unblocked: "
+                          + repr(tool_results[0]))
+
+
+class SetFaceFuzzyMatchTests(unittest.TestCase):
+    """Flagged as an open bench item in September, never closed until
+    2026-09-25: face_tunables/set_face_tunable already suggest a close
+    match on a speech-recognition slip ('acer' for 'aether'), but set_face
+    itself - the tool that actually switches the visible face - never
+    got the same fix and just flatly errored with no suggestion."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = pathlib.Path(self.tmp.name)
+        for name in ("aether", "circuit"):
+            (root / "faces" / name).mkdir(parents=True)
+            (root / "faces" / name / "index.html").write_text("<html></html>", encoding="utf-8")
+        (root / "ai-visualizer.json").write_text('{"face": "circuit"}', encoding="utf-8")
+        self.root = root
+        self.patches = [
+            patch.object(tools, "VISUALIZER_DIR", root),
+            patch.object(tools, "VISUALIZER_CONFIG_PATH", root / "ai-visualizer.json"),
+        ]
+        for pt in self.patches:
+            pt.start()
+
+    def tearDown(self):
+        for pt in self.patches:
+            pt.stop()
+        self.tmp.cleanup()
+
+    def test_near_miss_name_gets_a_suggestion_not_a_bare_error(self):
+        for typo in ("ether", "aeter", "acer"):
+            with self.subTest(typo=typo):
+                result = tools.set_face({"face": typo})
+                self.assertTrue(result.startswith("ERROR"), result)
+                self.assertIn("aether", result)
+
+    def test_config_is_untouched_on_a_near_miss(self):
+        before = (self.root / "ai-visualizer.json").read_text(encoding="utf-8")
+        tools.set_face({"face": "aeter"})
+        self.assertEqual((self.root / "ai-visualizer.json").read_text(encoding="utf-8"), before)
+
+    def test_a_name_with_nothing_close_gets_no_hint_but_still_errors(self):
+        result = tools.set_face({"face": "xyzzy_totally_unrelated"})
+        self.assertTrue(result.startswith("ERROR"), result)
+        self.assertNotIn("Did you mean", result)
+
+
 class RemoteGraniteRoutingTests(unittest.TestCase):
     """2026-09-20: granite can be served from ADLAPTOP over the LAN
     (JARVIS_REMOTE_GRANITE_URL), off by default, with a fallback to local

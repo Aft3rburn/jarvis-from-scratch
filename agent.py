@@ -160,6 +160,26 @@ _FACE_LOOK_CLAIM_RE = re.compile(
 )
 
 
+# Sibling guard to the one above, but for FACE CREATION specifically, not
+# a restyle of an existing one. Real incident, 2026-09-17: asked for "a
+# 100% original face," the model wrote a static webpage with an invented
+# schema - no core.js include, no AV.tick(dt) call, the two things every
+# real face in visualizer/faces/ actually has - then reported it as done.
+# A structurally incomplete face never actually renders as a working
+# visualizer face no matter how confidently the answer describes it.
+# Built and tested in isolation that same night, then deliberately
+# reverted unfinished (Mark's call, to fold it into the queued bench work
+# instead of shipping a fifth guard at 12:30 AM) - built for real now,
+# paired with `created_face_valid` below (set only when a face actually
+# touched this turn really has both markers).
+_FACE_CREATE_VERBS = r"created|creates|create|built|builds|build|generated|generates|generate"
+_FACE_CREATE_CLAIM_RE = re.compile(
+    rf"\b({_FACE_CREATE_VERBS})\b.{{0,40}}\b(a\s+|the\s+)?(new\s+)?face\b"
+    rf"|\b(new\s+)?face\b.{{0,40}}\bis\b.{{0,20}}\b(ready|done|complete|finished)\b",
+    re.IGNORECASE,
+)
+
+
 # General unbacked-change-claim guard, added 2026-09-20. Real incident:
 # asked to double the swarm in the orbit face, the model edited the wrong
 # file and answered "The swarm scaling parameter in the lessons has been
@@ -545,6 +565,13 @@ def _agentic_turn(
     edited_face_file = False
     style_claim_retries = 0
     MAX_STYLE_CLAIM_RETRIES = 1
+    # Sibling to edited_face_file above, but checks the WRITTEN CONTENT,
+    # not just that a write happened - see _FACE_CREATE_CLAIM_RE. Set
+    # True only when a face touched this turn actually has both a
+    # core.js include and a real AV.tick(dt) call afterward.
+    created_face_valid = False
+    face_create_claim_retries = 0
+    MAX_FACE_CREATE_CLAIM_RETRIES = 1
     # 2026-09-20: any state-changing tool that actually succeeded this
     # turn - see _CHANGE_CLAIM_RE.
     made_real_change = False
@@ -831,6 +858,58 @@ def _agentic_turn(
                 messages[-1]["content"] = answer
                 had_malformed_attempt = True
 
+            # Gated on edited_face_file (not just the claim regex alone) so
+            # this never fires on an ordinary set_face switch claim ("your
+            # aether face is ready") where no write happened this turn at
+            # all - that shape is nothing to do with this guard. See
+            # _FACE_CREATE_CLAIM_RE above.
+            if (
+                _FACE_CREATE_CLAIM_RE.search(answer)
+                and edited_face_file
+                and not created_face_valid
+            ):
+                if face_create_claim_retries < MAX_FACE_CREATE_CLAIM_RETRIES and step < MAX_STEPS:
+                    face_create_claim_retries += 1
+                    print(
+                        "\n(final answer claims a face was created/built "
+                        "but the written file is missing core.js and/or a "
+                        f"real AV.tick(dt) call - forcing a retry, raw "
+                        f"text: {answer!r})"
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "That's not actually a working face yet - "
+                                "it's missing a "
+                                "`<script src=\"../../core.js\"></script>` "
+                                "include and/or a real `AV.tick(dt)` call "
+                                "in its render loop, the same two things "
+                                "every other face in visualizer/faces/ "
+                                "has. Read an existing face's index.html "
+                                "(e.g. aether) for the real pattern, then "
+                                "fix the one you just wrote so it actually "
+                                "has both, or say plainly that it isn't "
+                                "done yet."
+                            ),
+                        }
+                    )
+                    continue
+                print(
+                    "\n(final answer still claims a face was created with "
+                    "a structurally incomplete file after "
+                    f"{MAX_FACE_CREATE_CLAIM_RETRIES} retry - replacing it "
+                    f"instead of speaking it, it was: {answer!r})"
+                )
+                answer = (
+                    "I said a face was created, but it's not actually a "
+                    "working one - it's missing the core.js include "
+                    "and/or a real AV.tick(dt) call every other face has. "
+                    "Try asking me again."
+                )
+                messages[-1]["content"] = answer
+                had_malformed_attempt = True
+
             print(f"\n=== answer ===\n{answer}")
             if speak_answer:
                 voice.speak(answer)  # sets its own speaking/idle bus state
@@ -879,6 +958,7 @@ def _agentic_turn(
                 name in ("write_file", "edit_file")
                 and target_face is not None
                 and target_face not in read_face_files
+                and (tools.VISUALIZER_DIR / "faces" / target_face / "index.html").exists()
             ):
                 # See read_face_files above - a face edit with no real
                 # read_file on that exact face this turn is refused
@@ -888,6 +968,16 @@ def _agentic_turn(
                 # here - the right next step (read_file, then retry the
                 # edit) is available in this same turn, no confirmation
                 # needed.
+                #
+                # Real gap found 2026-09-25 while building the sibling
+                # content-validity guard (_FACE_CREATE_CLAIM_RE): the
+                # exists() check here is required, not optional - without
+                # it this gate demands a successful read_file on a face
+                # that doesn't exist yet, which is impossible, so it
+                # silently made creating any brand-new face unreachable.
+                # Only an existing face's blind edit is what 2026-09-25's
+                # incident history (circuit clobber, aether->blue_board,
+                # swarm-doubling) actually calls for guarding against.
                 result = (
                     f"ERROR: you haven't actually read {target_face}'s own "
                     f"index.html this turn. Call read_file on that exact "
@@ -969,6 +1059,16 @@ def _agentic_turn(
                 and _touches_face_file(str(args.get("path", "")))
             ):
                 edited_face_file = True
+                _written_face = _face_name_from_path(str(args.get("path", "")))
+                if _written_face is not None and str(args.get("path", "")).endswith("index.html"):
+                    try:
+                        _written_content = (
+                            tools.VISUALIZER_DIR / "faces" / _written_face / "index.html"
+                        ).read_text(encoding="utf-8")
+                    except OSError:
+                        _written_content = ""
+                    if "core.js" in _written_content and re.search(r"AV\.tick\s*\(", _written_content):
+                        created_face_valid = True
             # set_face_tunable is a real, verified edit of a face's own
             # file (added 2026-09-20).
             if (
@@ -1033,7 +1133,7 @@ def run_task(
     invented one. run_voice_loop passes its own persistent `history` list
     so consecutive voice commands finally share real memory, the same way
     run_chat's turns always have."""
-    classification = router.classify(task)
+    classification = router.classify(task, active_face=tools._active_face_name() or None)
     chosen_model = MODEL
     if classification == router.EDIT:
         print(f"\n[router] classified EDIT -> {EDIT_MODEL} (face-edit task shape)")

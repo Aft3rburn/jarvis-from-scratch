@@ -100,7 +100,7 @@ _FACE_EDIT_VERBS_RE = re.compile(
 )
 _FACE_EDIT_NOUNS_RE = re.compile(
     r"\b(color|colour|motif|palette|scheme|hue|tint|lines?|feature|"
-    r"swarm|particles?|density|font)\b",
+    r"swarm|particles?|density|font|trails?|orbs?)\b",
     re.IGNORECASE,
 )
 
@@ -111,12 +111,24 @@ def _mentions_a_face(text: str) -> bool:
     return any(re.search(rf"\b{re.escape(n)}\b", text, re.IGNORECASE) for n in _face_names())
 
 
-def _is_face_edit(text: str) -> bool:
-    return bool(
-        _FACE_EDIT_VERBS_RE.search(text)
-        and _FACE_EDIT_NOUNS_RE.search(text)
-        and _mentions_a_face(text)
-    )
+def _is_face_edit(text: str, active_face: str | None = None) -> bool:
+    """`active_face`, when given, is whatever face is actually live right
+    now (tools._active_face_name()). Real incident, 2026-09-25: "make the
+    main orbs have more of a trail" is exactly EDIT-shaped (verb + visual
+    noun) but never names a face or says the word "face" at all - it
+    leans on Mark having just been talking about the orbit face, which
+    this router can't see since it only ever looks at one utterance at a
+    time. Rather than teach classify() to read conversation history
+    itself, the caller (agent.py's run_task, which already tracks the
+    live face) passes it in - a verb+noun match with a known active face
+    is treated as an edit even with no explicit face reference, since
+    "no face named and no face implied" is the only genuinely ambiguous
+    case left once both signals are missing."""
+    if not (_FACE_EDIT_VERBS_RE.search(text) and _FACE_EDIT_NOUNS_RE.search(text)):
+        return False
+    if _mentions_a_face(text):
+        return True
+    return bool(active_face)
 
 # Any of these appearing anywhere in the request is a strong signal it
 # needs real reasoning, generation, or multi-step work - never fast-path
@@ -173,19 +185,23 @@ FULL = "full"
 EDIT = "edit"
 
 
-def classify(text: str) -> str:
+def classify(text: str, active_face: str | None = None) -> str:
     """Return FAST, FULL, or EDIT for a given request. Pure function, no
     model call, sub-millisecond - the entire point is to decide BEFORE
     paying for any model's time. Errs toward FULL when unsure (see module
     docstring for why). EDIT (see _is_face_edit above) is checked first
     since it's the most specific signal - a request that both edits a
     face AND happens to contain a switch verb (e.g. "change aether's
-    color") is an edit, not a switch."""
+    color") is an edit, not a switch.
+
+    `active_face`, when given, only ever helps an already verb+noun-shaped
+    edit request through when it names no face itself - it can't turn an
+    unrelated sentence into an edit on its own. See _is_face_edit."""
     stripped = text.strip()
     if not stripped:
         return FAST  # empty/no-op input, nothing to reason about either way
 
-    if _is_face_edit(stripped):
+    if _is_face_edit(stripped, active_face):
         return EDIT
 
     if _FACE_SWITCH_RE.search(stripped):
